@@ -1,0 +1,121 @@
+package com.usblanbridge;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+
+/** Persisted settings. Deliberately small and typed, so the service and the activity agree on defaults. */
+public final class Prefs {
+
+    public static final String TARGET_USB = "usb";
+    public static final String TARGET_TCP = "tcp";
+    /** Built-in thermal printer on a Sunmi or compatible POS terminal, reached through the vendor service. */
+    public static final String TARGET_SUNMI = "sunmi";
+    /** A paired Bluetooth ESC/POS printer, over the serial port profile. */
+    public static final String TARGET_BLUETOOTH = "bt";
+
+    private static final String FILE = "bridge";
+    private final SharedPreferences p;
+
+    public Prefs(Context context) {
+        this.p = context.getApplicationContext().getSharedPreferences(FILE, Context.MODE_PRIVATE);
+    }
+
+    public int getRawPort() {
+        return p.getInt("rawPort", 9100);
+    }
+
+    public void setRawPort(int v) {
+        p.edit().putInt("rawPort", v).apply();
+    }
+
+    /** ePOS-Print port. Cannot be 80: an unrooted Android app may not bind below 1024. */
+    public int getEposPort() {
+        return p.getInt("eposPort", 8080);
+    }
+
+    public void setEposPort(int v) {
+        p.edit().putInt("eposPort", v).apply();
+    }
+
+    public boolean isEposEnabled() {
+        return p.getBoolean("epos", true);
+    }
+
+    public void setEposEnabled(boolean v) {
+        p.edit().putBoolean("epos", v).apply();
+    }
+
+    public boolean isStatusReplies() {
+        return p.getBoolean("statusReplies", true);
+    }
+
+    public void setStatusReplies(boolean v) {
+        p.edit().putBoolean("statusReplies", v).apply();
+    }
+
+    public String getModelName() {
+        return p.getString("modelName", "TM-T20II");
+    }
+
+    public void setModelName(String v) {
+        p.edit().putString("modelName", v).apply();
+    }
+
+    public int getIdleTimeoutMs() {
+        return p.getInt("idleMs", 1500);
+    }
+
+    public void setIdleTimeoutMs(int v) {
+        p.edit().putInt("idleMs", v).apply();
+    }
+
+    public String getTargetMode() {
+        return p.getString("target", TARGET_USB);
+    }
+
+    public void setTargetMode(String v) {
+        p.edit().putString("target", v).apply();
+    }
+
+    /** UsbDevice.getDeviceName() of the chosen printer, e.g. /dev/bus/usb/001/002. */
+    public String getUsbDeviceName() {
+        return p.getString("usbDevice", "");
+    }
+
+    public void setUsbDeviceName(String v) {
+        p.edit().putString("usbDevice", v).apply();
+    }
+
+    /** MAC address of the chosen paired Bluetooth printer. */
+    public String getBluetoothAddress() {
+        return p.getString("btAddress", "");
+    }
+
+    public void setBluetoothAddress(String v) {
+        p.edit().putString("btAddress", v).apply();
+    }
+
+    public String getTcpHost() {
+        return p.getString("tcpHost", "192.168.1.180");
+    }
+
+    public void setTcpHost(String v) {
+        p.edit().putString("tcpHost", v).apply();
+    }
+
+    public int getTcpPort() {
+        return p.getInt("tcpPort", 9100);
+    }
+
+    public void setTcpPort(int v) {
+        p.edit().putInt("tcpPort", v).apply();
+    }
+
+    public boolean isAutoStart() {
+        return p.getBoolean("autoStart", false);
+    }
+
+    public void setAutoStart(boolean v) {
+        p.edit().putBoolean("autoStart", v).apply();
+    }
+}

@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- .NET Framework 4.5 is inbox on Windows 8; 4.5.1 on 8.1; 4.6+ on Windows 10; 4.8 on Windows 11.
+         Targeting 4.5 means the exe runs on every Windows from 8 upwards with no runtime install. -->
+    <TargetFramework>net45</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>UsbLanPrinterBridge</RootNamespace>
+    <AssemblyName>UsbLanPrinterBridge</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Version>1.2.3</Version>
+    <FileVersion>1.2.3.0</FileVersion>
+    <AssemblyTitle>USB LAN Printer Bridge</AssemblyTitle>
+    <Product>USB LAN Printer Bridge</Product>
+    <Company>USB LAN Printer Bridge</Company>
+    <Copyright>MIT License</Copyright>
+    <Description>Exposes locally attached USB printers as RAW/9100 network printers on the LAN.</Description>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <DebugType>embedded</DebugType>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <WarningLevel>4</WarningLevel>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Lets the .NET SDK compile against .NET Framework 4.5 without a Visual Studio targeting pack installed. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <!-- Pure-managed self-signed certificate generation for the HTTPS ePOS endpoint (net40+; works Win8->11, no admin). -->
+    <PackageReference Include="Portable.BouncyCastle" Version="1.9.0" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <!-- Embed the BouncyCastle DLL into the exe and load it from resources at runtime (keeps a single-file build). -->
+  <ItemGroup>
+    <EmbeddedResource Include="$(PkgPortable_BouncyCastle)\lib\net40\BouncyCastle.Crypto.dll" Condition="Exists('$(PkgPortable_BouncyCastle)\lib\net40\BouncyCastle.Crypto.dll')">
+      <LogicalName>BouncyCastle.Crypto.dll</LogicalName>
+      <Visible>false</Visible>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Management" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Same icon as the exe resource, embedded so the window/tray can load it at any size. -->
+    <EmbeddedResource Include="app.ico" LogicalName="app.ico" />
+  </ItemGroup>
+
+</Project>
