@@ -1,0 +1,10 @@
+* text=auto
+
+# The Unix wrapper must keep LF or it fails with "bad interpreter" on Linux and macOS.
+gradlew      text eol=lf
+*.cmd        text eol=crlf
+*.bat        text eol=crlf
+
+*.jar        binary
+*.png        binary
+*.webp       binary
