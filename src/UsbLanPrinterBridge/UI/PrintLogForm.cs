@@ -174,8 +174,11 @@ namespace UsbLanPrinterBridge.UI
                 "Size    : " + r.Bytes + " bytes" + Environment.NewLine +
                 "Result  : " + r.Status + Environment.NewLine +
                 Environment.NewLine +
-                "Text sent to the printer:" + Environment.NewLine +
-                (string.IsNullOrEmpty(r.Preview) ? "(no readable text; this job was probably an image or a status exchange)" : r.Preview);
+                "The ticket as sent to the printer:" + Environment.NewLine +
+                "------------------------------------------------" + Environment.NewLine +
+                (string.IsNullOrEmpty(r.Ticket)
+                    ? (string.IsNullOrEmpty(r.Preview) ? "(nothing printable: this job was a status exchange, a drawer pulse or an image the bridge could not describe)" : r.Preview)
+                    : r.Ticket.Replace("\n", Environment.NewLine));
         }
 
         private static void OpenFolder(string path)

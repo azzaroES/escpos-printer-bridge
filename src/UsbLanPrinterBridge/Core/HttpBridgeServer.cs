@@ -237,6 +237,14 @@ namespace UsbLanPrinterBridge.Core
                 PrintHistory.Add(remote, _target.Name, "ePOS " + Scheme, escpos, escpos.Length, "Printed");
                 Emit("ePOS job printed to \"" + _target.Name + "\": " + BridgeListener.FormatBytes(escpos.Length) + " from " + remote
                      + (warnings.Count > 0 ? "  (" + warnings.Count + " warning(s): " + string.Join("; ", ToArray(warnings)) + ")" : ""));
+                try
+                {
+                    EscPosJobSummary summary = EscPosJobSummary.Analyze(escpos, escpos.Length);
+                    PrinterActionLog.Add(ActionLevel.Info, _target.Name, "ePOS " + remote, "Sent " + BridgeListener.FormatBytes(escpos.Length) + " to the printer (ePOS " + Scheme + ")",
+                        summary.Describe(), EscPosTicketText.Render(escpos, escpos.Length));
+                    foreach (string w in warnings) PrinterActionLog.Warn(_target.Name, "ePOS " + remote, "ePOS element not printed", w);
+                }
+                catch { /* diagnostics only */ }
                 responseXml = BuildResponse(true, "", OkStatus, printJobId);
             }
             catch (Exception ex)
@@ -244,7 +252,10 @@ namespace UsbLanPrinterBridge.Core
                 Emit("ePOS print from " + remote + " failed: " + ex.Message);
                 byte[] raw = Encoding.UTF8.GetBytes(bodyXml ?? "");
                 PrintHistory.Add(remote, _target.Name, "ePOS " + Scheme, raw, raw.Length, "Failed: " + ex.Message);
-                string code = ex is System.Xml.XmlException ? "SchemaError" : "EPTR_PRINT_SYSTEM_ERROR";
+                bool badXml = ex is System.Xml.XmlException;
+                PrinterActionLog.Error(_target.Name, "ePOS " + remote, badXml ? "ePOS document rejected (bad XML)" : "ePOS job failed",
+                    ex.Message + (badXml ? ". The app sent something that is not a valid ePOS-Print document; nothing was printed." : ". Nothing was printed; the app was told the print failed."));
+                string code = badXml ? "SchemaError" : "EPTR_PRINT_SYSTEM_ERROR";
                 responseXml = BuildResponse(false, code, OkStatus, printJobId);
             }
 

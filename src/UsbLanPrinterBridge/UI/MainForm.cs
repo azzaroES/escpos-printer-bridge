@@ -39,6 +39,27 @@ namespace UsbLanPrinterBridge.UI
         private ToolStripMenuItem _miSaveRaw;
         private PrintLogForm _printLog;
 
+        // NO CUT (per-printer emergency cutter bypass) and the printer actions tab
+        private DataGridViewCheckBoxColumn _colNoCut;
+        private NumericUpDown _numNoCutFeed;
+        private Button _btnNoCutOn, _btnNoCutOff;
+        private ToolStripMenuItem _miNoCut;
+        private ToolStripMenuItem _miTrayNoCut;
+        private bool _configLoaded;
+        private bool _trayMenuRebuildPending;
+        private TabControl _tabs;
+        private TabPage _tabLog;
+        private TabPage _tabActions;
+        private DataGridView _actions;
+        private TextBox _actionDetail;
+        private SplitContainer _actionSplit;
+        private bool _actionSplitPlaced;
+        private CheckBox _chkFollowActions;
+        private DateTime _lastPrinterWatch = DateTime.MinValue;
+        private bool _watchingPrinters;
+        private const int MaxActionRows = 2000;
+        private static readonly Color NoCutBack = Color.FromArgb(255, 226, 226);
+
         // controls
         private MenuStrip _menu;
         private ToolStripMenuItem _miStartWithWindows;
@@ -69,6 +90,7 @@ namespace UsbLanPrinterBridge.UI
             _options = options ?? new StartupOptions();
             BuildUi();
             Logger.EntryAdded += OnLogEntry;
+            PrinterActionLog.ActionAdded += OnPrinterAction;
             _manager.ListenerChanged += OnListenerChanged;
         }
 
@@ -120,6 +142,30 @@ namespace UsbLanPrinterBridge.UI
             settings.Controls.AddRange(new Control[] { _chkFirewall, _chkAutoStart, _chkTray });
             new ToolTip().SetToolTip(_numIdle, "A print job is sent to the printer when the client disconnects, or after this much silence on an open connection.\n0 = only when the client disconnects.");
 
+            // The emergency row: NO CUT is per printer. Tick "No cut" on a row, or use these buttons for the selected rows.
+            // Event handlers are attached after the initial values are set, so building the UI never saves the config.
+            var emergency = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Padding = new Padding(0, 0, 0, 2) };
+            var lblNoCut = new Label { Text = "NO CUT (emergency, per printer):", AutoSize = true, Font = new Font(Font, FontStyle.Bold), ForeColor = Color.Firebrick, Margin = new Padding(3, 8, 6, 0) };
+            _btnNoCutOn = MakeButton("ON for selected", (s, e) => SetNoCutForSelected(true));
+            _btnNoCutOff = MakeButton("OFF for selected", (s, e) => SetNoCutForSelected(false));
+            _numNoCutFeed = new NumericUpDown { Minimum = 0, Maximum = NoCutSettings.MaxFeedLines, Value = 4, Width = 48, Margin = new Padding(3, 4, 3, 0) };
+            emergency.Controls.Add(lblNoCut);
+            emergency.Controls.Add(_btnNoCutOn);
+            emergency.Controls.Add(_btnNoCutOff);
+            emergency.Controls.Add(new Label { Text = "feed", AutoSize = true, Margin = new Padding(9, 8, 0, 0) });
+            emergency.Controls.Add(_numNoCutFeed);
+            emergency.Controls.Add(new Label { Text = "lines instead of each cut.   Or tick \"No cut\" on a row; F8 toggles the selected rows; the tray menu lists each printer.", AutoSize = true, Margin = new Padding(0, 8, 0, 0), ForeColor = SystemColors.GrayText });
+            _numNoCutFeed.ValueChanged += (s, e) => ApplyFeedLines(true);
+            var tipNoCut = new ToolTip();
+            string noCutTip =
+                "Cutter commands (GS V, ESC i, ESC m) are stripped from every job to the selected printers, raw 9100 and ePOS alike,\n" +
+                "whatever the POS app or printer driver asked for. Takes effect immediately, even on a job already streaming,\n" +
+                "and is saved at once. Use it when a cutter is jammed, broken or must not cut. Tear receipts by hand at the tear bar.\n" +
+                "Image and QR data are parsed, not pattern-matched, so cut-like bytes inside a logo are left alone.";
+            tipNoCut.SetToolTip(_btnNoCutOn, noCutTip);
+            tipNoCut.SetToolTip(_btnNoCutOff, "Cutter commands reach the selected printers again.");
+            tipNoCut.SetToolTip(_numNoCutFeed, "Lines fed in place of each removed cut so the receipt comes out past the tear bar. 0 = nothing. Applies to every printer with No cut on.");
+
             _log = new TextBox
             {
                 Dock = DockStyle.Fill,
@@ -132,9 +178,18 @@ namespace UsbLanPrinterBridge.UI
                 HideSelection = false
             };
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, Padding = new Padding(8, 4, 8, 4) };
+            _tabs = new TabControl { Dock = DockStyle.Fill };
+            _tabLog = new TabPage("Log") { Padding = new Padding(0) };
+            _tabLog.Controls.Add(_log);
+            _tabActions = new TabPage("Printer actions") { Padding = new Padding(0) };
+            _tabActions.Controls.Add(BuildActionsTab());
+            _tabs.TabPages.Add(_tabLog);
+            _tabs.TabPages.Add(_tabActions);
+
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(8, 4, 8, 4) };
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 58));
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 42));
@@ -142,7 +197,8 @@ namespace UsbLanPrinterBridge.UI
             layout.Controls.Add(_grid, 0, 1);
             layout.Controls.Add(buttons, 0, 2);
             layout.Controls.Add(settings, 0, 3);
-            layout.Controls.Add(_log, 0, 4);
+            layout.Controls.Add(emergency, 0, 4);
+            layout.Controls.Add(_tabs, 0, 5);
 
             _status = new StatusStrip { SizingGrip = true };
             _lblStatus = new ToolStripStatusLabel("Ready") { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
@@ -177,6 +233,9 @@ namespace UsbLanPrinterBridge.UI
             var bridges = new ToolStripMenuItem("&Bridges");
             bridges.DropDownItems.Add(new ToolStripMenuItem("Start &all", null, (s, e) => StartAll()) { ShortcutKeys = Keys.F5 });
             bridges.DropDownItems.Add(new ToolStripMenuItem("St&op all", null, (s, e) => StopAll()) { ShortcutKeys = Keys.F6 });
+            bridges.DropDownItems.Add(new ToolStripSeparator());
+            _miNoCut = new ToolStripMenuItem("Emergency: toggle &NO CUT for the selected printers", null, (s, e) => ToggleNoCutSelected()) { ShortcutKeys = Keys.F8 };
+            bridges.DropDownItems.Add(_miNoCut);
             bridges.DropDownItems.Add(new ToolStripSeparator());
             bridges.DropDownItems.Add(new ToolStripMenuItem("&Refresh printers and adapters", null, (s, e) => RefreshDevices()) { ShortcutKeys = Keys.F4 });
 
@@ -241,6 +300,7 @@ namespace UsbLanPrinterBridge.UI
             _colAdapter = new DataGridViewComboBoxColumn { HeaderText = "Adapter", FillWeight = 70, MinimumWidth = 90, FlatStyle = FlatStyle.Flat };
             _colEsc = new DataGridViewCheckBoxColumn { HeaderText = "Status replies", FillWeight = 40, MinimumWidth = 64, ToolTipText = "Answer DLE EOT status requests with 'printer OK' so POS apps don't wait for a reply the USB printer cannot send (raw/9100 only)" };
             _colEpos = new DataGridViewCheckBoxColumn { HeaderText = "ePOS web", FillWeight = 40, MinimumWidth = 64, ToolTipText = "Also serve the Epson ePOS-Print endpoints (HTTP 80 + 8008, HTTPS 443 + 8043) so browser/Android POS apps can print to this printer" };
+            _colNoCut = new DataGridViewCheckBoxColumn { HeaderText = "No cut", FillWeight = 36, MinimumWidth = 54, ToolTipText = "EMERGENCY, this printer only: remove every cutter command from every job sent to it, whatever the app or driver asked for, and feed to the tear bar instead. Works while the bridge is running and applies at once." };
             _colState = new DataGridViewTextBoxColumn { HeaderText = "Status", FillWeight = 110, MinimumWidth = 120, ReadOnly = true };
             _colJobs = new DataGridViewTextBoxColumn { HeaderText = "Jobs", FillWeight = 32, MinimumWidth = 42, ReadOnly = true };
             _colBytes = new DataGridViewTextBoxColumn { HeaderText = "Data", FillWeight = 42, MinimumWidth = 56, ReadOnly = true };
@@ -253,17 +313,19 @@ namespace UsbLanPrinterBridge.UI
             _colJobs.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
             _colBytes.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
 
-            _grid.Columns.AddRange(new DataGridViewColumn[] { _colOn, _colPrinter, _colIp, _colPort, _colAdapter, _colEsc, _colEpos, _colState, _colJobs, _colBytes });
+            _grid.Columns.AddRange(new DataGridViewColumn[] { _colOn, _colPrinter, _colIp, _colPort, _colAdapter, _colEsc, _colEpos, _colNoCut, _colState, _colJobs, _colBytes });
 
             _grid.DataError += (s, e) => { e.ThrowException = false; };
             _grid.CurrentCellDirtyStateChanged += (s, e) => { if (_grid.IsCurrentCellDirty) _grid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
             _grid.CellValueChanged += (s, e) => { if (!_loadingGrid && e.RowIndex >= 0) SyncRowToMapping(_grid.Rows[e.RowIndex], e.ColumnIndex); };
             _grid.CellValidating += OnCellValidating;
             _grid.SelectionChanged += (s, e) => UpdateButtons();
+            _grid.KeyDown += (s, e) => { if (e.KeyCode == Keys.Delete && !_grid.IsCurrentCellInEditMode) { e.Handled = true; RemoveSelected(); } };
             _grid.CellBeginEdit += (s, e) =>
             {
                 MappingConfig m = MappingOf(_grid.Rows[e.RowIndex]);
-                if (m != null && _manager.IsRunning(m) && e.ColumnIndex != _colOn.Index)
+                // "On" and "No cut" may change while running: the first only affects Start all, the second is an emergency switch.
+                if (m != null && _manager.IsRunning(m) && e.ColumnIndex != _colOn.Index && e.ColumnIndex != _colNoCut.Index)
                 {
                     e.Cancel = true;
                     // Cancelling silently just looks broken: the cell refuses to open and nothing says why.
@@ -279,6 +341,11 @@ namespace UsbLanPrinterBridge.UI
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("Start all bridges", null, (s, e) => StartAll()));
             menu.Items.Add(new ToolStripMenuItem("Stop all bridges", null, (s, e) => StopAll()));
+            menu.Items.Add(new ToolStripSeparator());
+            _miTrayNoCut = new ToolStripMenuItem("Emergency: NO CUT, per printer");
+            _miTrayNoCut.DropDownOpening += (s, e) => RebuildTrayNoCutMenu();
+            RebuildTrayNoCutMenu();
+            menu.Items.Add(_miTrayNoCut);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("Exit", null, (s, e) => ExitApplication()));
 
@@ -329,6 +396,17 @@ namespace UsbLanPrinterBridge.UI
             ApplyIdleTimeout();
             _manager.AutoFirewallRule = _config.AutoFirewallRule;
 
+            // NO CUT: the feed count is shared; the switch itself is per mapping and lives in the grid ("No cut" column).
+            _numNoCutFeed.Value = _config.SanitizedNoCutFeedLines;
+            ApplyFeedLines(false);
+            if (_options.NoCut)
+            {
+                foreach (MappingConfig m in _config.Mappings) m.NoCut = true;
+                Logger.Warn("--no-cut: NO CUT is on for every mapping. Untick \"No cut\" on a row to let that printer cut again.");
+            }
+            _configLoaded = true;
+            ReloadActions();
+
             Logger.Info("Configuration: " + ConfigStore.ConfigPath);
             if (!_manager.IsElevated)
                 Logger.Warn("Not running as administrator. Bridges can use this PC's existing addresses (or 0.0.0.0) but cannot add virtual addresses or firewall rules.");
@@ -363,6 +441,7 @@ namespace UsbLanPrinterBridge.UI
         {
             _timer.Stop();
             Logger.EntryAdded -= OnLogEntry;
+            PrinterActionLog.ActionAdded -= OnPrinterAction;
             _manager.ListenerChanged -= OnListenerChanged;
             SyncConfigFromGrid();
             SaveConfig(false);
@@ -471,6 +550,7 @@ namespace UsbLanPrinterBridge.UI
                 _loadingGrid = false;
             }
             UpdateButtons();
+            RebuildTrayNoCutMenu();
         }
 
         private void FillRow(DataGridViewRow row, MappingConfig m)
@@ -482,6 +562,7 @@ namespace UsbLanPrinterBridge.UI
             row.Cells[_colAdapter.Index].Value = string.IsNullOrEmpty(m.Adapter) ? AutoAdapter : m.Adapter;
             row.Cells[_colEsc.Index].Value = m.EscPosStatusReplies;
             row.Cells[_colEpos.Index].Value = m.EposEnabled;
+            row.Cells[_colNoCut.Index].Value = m.NoCut;
             UpdateRowStatus(row);
         }
 
@@ -506,6 +587,11 @@ namespace UsbLanPrinterBridge.UI
             }
             else if (columnIndex == _colEsc.Index) m.EscPosStatusReplies = v is bool && (bool)v;
             else if (columnIndex == _colEpos.Index) m.EposEnabled = v is bool && (bool)v;
+            else if (columnIndex == _colNoCut.Index)
+            {
+                bool on = v is bool && (bool)v;
+                if (on != m.NoCut) SetNoCut(m, on, row, true);
+            }
 
             if (columnIndex == _colOn.Index)
             {
@@ -527,6 +613,7 @@ namespace UsbLanPrinterBridge.UI
             _config.AutoFirewallRule = _chkFirewall.Checked;
             _config.AutoStartBridges = _chkAutoStart.Checked;
             _config.CloseToTray = _chkTray.Checked;
+            _config.NoCutFeedLines = (int)_numNoCutFeed.Value;
         }
 
         private void OnCellValidating(object sender, DataGridViewCellValidatingEventArgs e)
@@ -593,22 +680,49 @@ namespace UsbLanPrinterBridge.UI
             return p == null ? null : p.Name;
         }
 
-        private void RemoveSelected()
+        /// <summary>Removes every selected row. Running bridges are stopped first, after one confirmation.</summary>
+        private async void RemoveSelected()
         {
+            if (_busy) return;
             var rows = SelectedRows();
             if (rows.Count == 0) return;
-            if (rows.Any(r => _manager.IsRunning(MappingOf(r))))
+            var mappings = rows.Select(MappingOf).Where(m => m != null).ToList();
+            int running = mappings.Count(m => _manager.IsRunning(m));
+            if (running > 0)
             {
-                MessageBox.Show(this, "Stop the selected bridge(s) before removing them.", Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
+                DialogResult r = MessageBox.Show(this,
+                    running + " of the " + rows.Count + " selected bridge" + (rows.Count == 1 ? " is" : "s are") + " running.\n\nStop " + (running == 1 ? "it" : "them") + " and remove all " + rows.Count + " selected row" + (rows.Count == 1 ? "" : "s") + "?",
+                    Program.AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (r != DialogResult.Yes) return;
             }
-            foreach (DataGridViewRow r in rows)
+
+            SetBusy(true);
+            try
             {
-                MappingConfig m = MappingOf(r);
-                if (m != null) { _manager.Forget(m); _wanted.Remove(m.Id); _config.Mappings.Remove(m); }
-                _grid.Rows.Remove(r);
+                // Stop on a worker thread (releasing a virtual address can take a moment), then drop the rows.
+                await Task.Run(() => { foreach (MappingConfig m in mappings) _manager.Forget(m); });
+                foreach (MappingConfig m in mappings)
+                {
+                    _wanted.Remove(m.Id);
+                    _config.Mappings.Remove(m);
+                }
+                _loadingGrid = true;
+                try
+                {
+                    foreach (DataGridViewRow r in rows) _grid.Rows.Remove(r);
+                }
+                finally { _loadingGrid = false; }
+                Logger.Info("Removed " + mappings.Count + " mapping" + (mappings.Count == 1 ? "" : "s") + ": "
+                            + string.Join(", ", mappings.Select(m => (m.PrinterName ?? "?") + " @ " + m.EndpointText).ToArray()));
+                SaveConfig(false);
+                RebuildTrayNoCutMenu();
             }
-            UpdateButtons();
+            finally
+            {
+                SetBusy(false);
+                UpdateButtons();
+                UpdateStatusBar();
+            }
         }
 
         private List<DataGridViewRow> SelectedRows()
@@ -775,9 +889,13 @@ namespace UsbLanPrinterBridge.UI
                     default: text = "Stopped"; color = SystemColors.GrayText; break;
                 }
             }
+            if (m.NoCut) text = "NO CUT · " + text;
             if (!Equals(state.Value, text)) state.Value = text;
             state.Style.ForeColor = color;
-            state.ToolTipText = l != null && l.State == BridgeState.Error ? l.StatusText : "";
+            state.ToolTipText = l != null && l.State == BridgeState.Error ? l.StatusText : (m.NoCut ? "NO CUT is on: cutter commands are removed from every job to this printer." : "");
+            DataGridViewCell noCutCell = row.Cells[_colNoCut.Index];
+            Color noCutBack = m.NoCut ? NoCutBack : Color.Empty;
+            if (noCutCell.Style.BackColor != noCutBack) noCutCell.Style.BackColor = noCutBack;
 
             string jobs = l == null ? "" : l.JobsCompleted.ToString();
             string bytes = l == null ? "" : BridgeListener.FormatBytes(l.BytesReceived);
@@ -799,6 +917,14 @@ namespace UsbLanPrinterBridge.UI
             string text = running == 0
                 ? "No bridges running."
                 : running + " bridge" + (running == 1 ? "" : "s") + " listening · " + clients + " connected · " + jobs + " job" + (jobs == 1 ? "" : "s") + " · " + BridgeListener.FormatBytes(bytes);
+            int noCut = _config.Mappings.Count(m => m.NoCut);
+            if (noCut > 0)
+            {
+                long removed = NoCutSettings.CutsRemoved;
+                text = "NO CUT on " + noCut + " printer" + (noCut == 1 ? "" : "s") + " (" + removed + " cut" + (removed == 1 ? "" : "s") + " removed) · " + text;
+                _lblStatus.ForeColor = Color.Firebrick;
+            }
+            else _lblStatus.ForeColor = SystemColors.ControlText;
             _lblStatus.Text = text;
             _tray.Text = Truncate(Program.AppName + " — " + text, 63);
         }
@@ -813,6 +939,342 @@ namespace UsbLanPrinterBridge.UI
             _btnStopAll.Enabled = !_busy && _manager.RunningCount > 0;
             SuperviseBridges();
             CheckVirtualAddresses();
+            WatchPrinters();
+        }
+
+        /// <summary>Every 5 s, asks Windows about the printers of the running bridges; changes go to the printer actions tab.</summary>
+        private void WatchPrinters()
+        {
+            if (_watchingPrinters) return;
+            if ((DateTime.Now - _lastPrinterWatch).TotalSeconds < 5) return;
+            _lastPrinterWatch = DateTime.Now;
+            var names = _manager.Listeners.Where(l => l.IsRunning).Select(l => l.Target.Name).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (names.Count == 0) return;
+            _watchingPrinters = true;
+            Task.Run(() =>
+            {
+                try { PrinterWatch.Poll(names, "watch"); }
+                catch { }
+                finally { _watchingPrinters = false; }
+            });
+        }
+
+        // =====================================================================================  NO CUT (per printer)
+
+        private void ApplyFeedLines(bool fromUser)
+        {
+            int feed = (int)_numNoCutFeed.Value;
+            _config.NoCutFeedLines = feed;
+            NoCutSettings.FeedLines = feed;
+            if (fromUser && _configLoaded) SaveConfig(false);
+        }
+
+        /// <summary>
+        /// Switches NO CUT for one printer and records it. Works while its bridge runs: the filter reads the flag
+        /// on every write, so the very next bytes are affected.
+        /// </summary>
+        private void SetNoCut(MappingConfig m, bool on, DataGridViewRow row, bool save)
+        {
+            if (m == null) return;
+            bool changed = m.NoCut != on;
+            m.NoCut = on;
+            if (row == null) row = RowOf(m);
+            if (row != null)
+            {
+                DataGridViewCell cell = row.Cells[_colNoCut.Index];
+                if (!Equals(cell.Value, on)) cell.Value = on;
+                UpdateRowStatus(row);
+            }
+            if (changed)
+            {
+                string printer = string.IsNullOrEmpty(m.PrinterName) ? "?" : m.PrinterName;
+                int feed = NoCutSettings.FeedLines;
+                if (on)
+                {
+                    Logger.Warn("NO CUT is ON for \"" + printer + "\" (" + m.EndpointText + "): every cutter command is removed"
+                                + (feed > 0 ? " and replaced by a " + feed + "-line feed" : "") + ". Tear receipts by hand. Untick \"No cut\" on the row to cut again.");
+                    PrinterActionLog.Warn(printer, "user", "NO CUT switched on for this printer",
+                        "Cutter commands (GS V, ESC i, ESC m) are removed from every job to this printer" + (feed > 0 ? "; each is replaced by a " + feed + "-line feed so the paper reaches the tear bar." : "."));
+                }
+                else
+                {
+                    Logger.Info("NO CUT is OFF for \"" + printer + "\": cutter commands reach the printer again.");
+                    PrinterActionLog.Info(printer, "user", "NO CUT switched off for this printer", "Cutter commands reach the printer again.");
+                }
+            }
+            if (_lblStatus != null) UpdateStatusBar();
+            ScheduleTrayMenuRebuild();
+            // An emergency switch must survive a crash or a restart, so it is saved the moment it changes.
+            if (save && changed && _configLoaded) SaveConfig(false);
+        }
+
+        private void SetNoCutForSelected(bool on)
+        {
+            var rows = SelectedRows();
+            if (rows.Count == 0)
+            {
+                MessageBox.Show(this, "Select one or more printer rows first, or tick the \"No cut\" box on a row.", Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            foreach (DataGridViewRow r in rows) SetNoCut(MappingOf(r), on, r, false);
+            SaveConfig(false);
+        }
+
+        /// <summary>F8: if every selected row already has NO CUT on, switch them off; otherwise switch them all on.</summary>
+        private void ToggleNoCutSelected()
+        {
+            var rows = SelectedRows();
+            if (rows.Count == 0) return;
+            bool allOn = rows.All(r => MappingOf(r) != null && MappingOf(r).NoCut);
+            SetNoCutForSelected(!allOn);
+        }
+
+        /// <summary>The tray submenu lists every printer with a tick, so NO CUT can be flipped without opening the window.</summary>
+        private void RebuildTrayNoCutMenu()
+        {
+            _trayMenuRebuildPending = false;
+            if (_miTrayNoCut == null) return;
+            _miTrayNoCut.DropDownItems.Clear();
+            if (_config.Mappings.Count == 0)
+            {
+                _miTrayNoCut.DropDownItems.Add(new ToolStripMenuItem("(no printers configured)") { Enabled = false });
+                return;
+            }
+            foreach (MappingConfig m in _config.Mappings)
+            {
+                MappingConfig captured = m;
+                string name = (string.IsNullOrEmpty(m.PrinterName) ? "?" : m.PrinterName) + "    " + m.EndpointText;
+                var item = new ToolStripMenuItem(name) { Checked = m.NoCut, CheckOnClick = false };
+                item.Click += (s, e) => SetNoCut(captured, !captured.NoCut, null, true);
+                _miTrayNoCut.DropDownItems.Add(item);
+            }
+            _miTrayNoCut.DropDownItems.Add(new ToolStripSeparator());
+            var allOff = new ToolStripMenuItem("Switch NO CUT off on every printer");
+            allOff.Click += (s, e) => { foreach (MappingConfig m in _config.Mappings) SetNoCut(m, false, null, false); SaveConfig(false); };
+            _miTrayNoCut.DropDownItems.Add(allOff);
+        }
+
+        /// <summary>Rebuilding the menu from inside one of its own click handlers is asking for trouble, so defer it.</summary>
+        private void ScheduleTrayMenuRebuild()
+        {
+            if (_trayMenuRebuildPending) return;
+            _trayMenuRebuildPending = true;
+            if (IsHandleCreated) { try { BeginInvoke(new Action(RebuildTrayNoCutMenu)); return; } catch { } }
+            RebuildTrayNoCutMenu();
+        }
+
+        // =====================================================================================  printer actions tab
+
+        private Control BuildActionsTab()
+        {
+            _actions = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                AllowUserToResizeRows = false,
+                ReadOnly = true,
+                RowHeadersVisible = false,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = true,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize,
+                BackgroundColor = SystemColors.Window,
+                BorderStyle = BorderStyle.FixedSingle,
+                StandardTab = true
+            };
+            _actions.RowTemplate.Height = 20;
+            _actions.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Time", FillWeight = 38, MinimumWidth = 58 });
+            _actions.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Printer", FillWeight = 90, MinimumWidth = 90 });
+            _actions.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "From", FillWeight = 85, MinimumWidth = 80 });
+            _actions.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "What happened", FillWeight = 150, MinimumWidth = 140 });
+            _actions.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Details", FillWeight = 300, MinimumWidth = 160 });
+            _actions.CellDoubleClick += (s, e) => ShowActionDetail(e.RowIndex);
+            _actions.SelectionChanged += (s, e) => ShowSelectedAction();
+
+            // The ticket pane: the selected job as it went to the printer, line by line.
+            _actionDetail = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Both,
+                WordWrap = false,
+                Font = new Font(FontFamily.GenericMonospace, 9f),
+                BackColor = Color.FromArgb(253, 253, 246),
+                HideSelection = false
+            };
+            _actionSplit = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Vertical };
+            _actionSplit.Panel1.Controls.Add(_actions);
+            _actionSplit.Panel2.Controls.Add(_actionDetail);
+            _actionSplit.Resize += (s, e) =>
+            {
+                // Minimum sizes and the 60/40 split are only valid once the pane has a real width; set them then, once.
+                if (_actionSplitPlaced || _actionSplit.Width < 500) return;
+                _actionSplitPlaced = true;
+                try
+                {
+                    _actionSplit.SplitterDistance = (int)(_actionSplit.Width * 0.6);
+                    _actionSplit.Panel1MinSize = 200;
+                    _actionSplit.Panel2MinSize = 200;
+                }
+                catch { }
+            };
+
+            var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(2, 2, 2, 0) };
+            bar.Controls.Add(SmallButton("Clear", (s, e) => { PrinterActionLog.Clear(); ReloadActions(); }));
+            bar.Controls.Add(SmallButton("Copy selected (with ticket)", (s, e) => CopyActions()));
+            bar.Controls.Add(SmallButton("Open log folder", (s, e) => OpenFolder(ConfigStore.LogDirectory)));
+            _chkFollowActions = new CheckBox { Text = "Follow new entries", Checked = true, AutoSize = true, Margin = new Padding(12, 5, 6, 0) };
+            bar.Controls.Add(_chkFollowActions);
+            bar.Controls.Add(new Label
+            {
+                Text = "Select a row: the ticket as it went to the printer appears on the right. Also in logs\\printer-actions-YYYYMMDD.log.",
+                AutoSize = true,
+                ForeColor = SystemColors.GrayText,
+                Margin = new Padding(12, 7, 0, 0)
+            });
+
+            var host = new Panel { Dock = DockStyle.Fill };
+            host.Controls.Add(_actionSplit);
+            host.Controls.Add(bar);
+            return host;
+        }
+
+        private void ShowSelectedAction()
+        {
+            if (_actionDetail == null) return;
+            if (_actions.SelectedRows.Count == 0) { _actionDetail.Text = ""; return; }
+            var a = _actions.SelectedRows[0].Tag as PrinterAction;
+            if (a == null) { _actionDetail.Text = ""; return; }
+            var sb = new StringBuilder();
+            sb.Append(a.Time.ToString("HH:mm:ss")).Append("  ").Append(a.Printer).Append("  <-  ").Append(a.Source).AppendLine();
+            sb.AppendLine(a.What);
+            if (!string.IsNullOrEmpty(a.Detail)) sb.AppendLine(a.Detail);
+            if (a.HasTicket)
+            {
+                sb.AppendLine();
+                sb.AppendLine("Ticket as sent to the printer:");
+                sb.AppendLine("================================================");
+                sb.Append(a.Ticket.Replace("\n", Environment.NewLine));
+                sb.AppendLine();
+                sb.AppendLine("================================================");
+            }
+            _actionDetail.Text = sb.ToString();
+            _actionDetail.SelectionStart = 0;
+            _actionDetail.SelectionLength = 0;
+        }
+
+        private Button SmallButton(string text, EventHandler onClick)
+        {
+            var b = new Button { Text = text, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(6, 0, 6, 0), MinimumSize = new Size(0, 24), Margin = new Padding(2) };
+            b.Click += onClick;
+            return b;
+        }
+
+        private void OnPrinterAction(PrinterAction a)
+        {
+            if (IsDisposed) return;
+            try
+            {
+                if (InvokeRequired) BeginInvoke(new Action<PrinterAction>(AppendAction), a);
+                else AppendAction(a);
+            }
+            catch { }
+        }
+
+        private void AppendAction(PrinterAction a)
+        {
+            if (_actions == null || _actions.IsDisposed) return;
+            int idx = _actions.Rows.Add(a.TimeText, a.Printer, a.Source, a.What, a.Detail);
+            DataGridViewRow row = _actions.Rows[idx];
+            row.Tag = a;
+            if (a.Level == ActionLevel.Error) row.DefaultCellStyle.ForeColor = Color.Firebrick;
+            else if (a.Level == ActionLevel.Warn) row.DefaultCellStyle.ForeColor = Color.FromArgb(176, 96, 0);
+            while (_actions.Rows.Count > MaxActionRows) _actions.Rows.RemoveAt(0);
+            if (_chkFollowActions.Checked && _actions.Rows.Count > 0)
+            {
+                try { _actions.FirstDisplayedScrollingRowIndex = _actions.Rows.Count - 1; } catch { }
+            }
+            UpdateActionsTabText();
+        }
+
+        private void ReloadActions()
+        {
+            if (_actions == null) return;
+            _actions.SuspendLayout();
+            _actions.Rows.Clear();
+            List<PrinterAction> all = PrinterActionLog.Snapshot();
+            int start = Math.Max(0, all.Count - MaxActionRows);
+            for (int i = start; i < all.Count; i++)
+            {
+                PrinterAction a = all[i];
+                int idx = _actions.Rows.Add(a.TimeText, a.Printer, a.Source, a.What, a.Detail);
+                _actions.Rows[idx].Tag = a;
+                if (a.Level == ActionLevel.Error) _actions.Rows[idx].DefaultCellStyle.ForeColor = Color.Firebrick;
+                else if (a.Level == ActionLevel.Warn) _actions.Rows[idx].DefaultCellStyle.ForeColor = Color.FromArgb(176, 96, 0);
+            }
+            _actions.ResumeLayout();
+            if (_actions.Rows.Count > 0)
+            {
+                try
+                {
+                    int last = _actions.Rows.Count - 1;
+                    _actions.ClearSelection();
+                    _actions.Rows[last].Selected = true;
+                    _actions.FirstDisplayedScrollingRowIndex = last;
+                }
+                catch { }
+            }
+            else if (_actionDetail != null) _actionDetail.Text = "";
+            UpdateActionsTabText();
+        }
+
+        private void UpdateActionsTabText()
+        {
+            int count = PrinterActionLog.Count;
+            int errors = PrinterActionLog.ErrorCount;
+            int warnings = PrinterActionLog.WarningCount;
+            string text = "Printer actions";
+            if (count > 0)
+            {
+                text += " (" + count;
+                if (errors > 0) text += ", " + errors + " error" + (errors == 1 ? "" : "s");
+                if (warnings > 0) text += ", " + warnings + " warning" + (warnings == 1 ? "" : "s");
+                text += ")";
+            }
+            if (_tabActions.Text != text) _tabActions.Text = text;
+        }
+
+        private void ShowActionDetail(int rowIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= _actions.Rows.Count) return;
+            var a = _actions.Rows[rowIndex].Tag as PrinterAction;
+            if (a == null) return;
+            MessageBox.Show(this,
+                "Time    : " + a.Time.ToString("yyyy-MM-dd HH:mm:ss") + "\n" +
+                "Printer : " + a.Printer + "\n" +
+                "From    : " + a.Source + "\n" +
+                "Level   : " + a.Level + "\n\n" +
+                a.What + "\n\n" + a.Detail +
+                (a.HasTicket ? "\n\nTicket as sent to the printer:\n\n" + a.Ticket : ""),
+                "Printer action", MessageBoxButtons.OK, a.Level == ActionLevel.Error ? MessageBoxIcon.Error : a.Level == ActionLevel.Warn ? MessageBoxIcon.Warning : MessageBoxIcon.Information);
+        }
+
+        private void CopyActions()
+        {
+            var sb = new StringBuilder();
+            var rows = new List<DataGridViewRow>();
+            foreach (DataGridViewRow r in _actions.SelectedRows) rows.Add(r);
+            if (rows.Count == 0) foreach (DataGridViewRow r in _actions.Rows) rows.Add(r);
+            rows.Sort((x, y) => x.Index.CompareTo(y.Index));
+            foreach (DataGridViewRow r in rows)
+            {
+                var a = r.Tag as PrinterAction;
+                if (a != null) sb.AppendLine(a.FullText);
+            }
+            if (sb.Length == 0) return;
+            try { Clipboard.SetText(sb.ToString()); } catch { }
         }
 
         /// <summary>Every 15 s, re-add virtual addresses that Windows dropped (Wi-Fi reconnect, adapter reset...).</summary>
@@ -939,7 +1401,15 @@ namespace UsbLanPrinterBridge.UI
                 {
                     if (!throughBridge)
                     {
-                        new SpoolerPrintTarget(m.PrinterName).PrintBytes("Bridge test page", data);
+                        // Through this printer's NO CUT filter, like real jobs, so the test page shows what a receipt would do.
+                        IPrintTarget direct = new NoCutPrintTarget(new SpoolerPrintTarget(m.PrinterName), () => m.NoCut);
+                        using (IPrintJob job = direct.StartJob("Bridge test page"))
+                        {
+                            job.Write(data, 0, data.Length);
+                            job.Complete();
+                        }
+                        PrinterActionLog.Add(ActionLevel.Info, m.PrinterName, "test page", "Sent the test page directly to the Windows queue",
+                            EscPosJobSummary.Analyze(data, data.Length).Describe(), EscPosTicketText.Render(data, data.Length));
                         return "Test page sent directly to \"" + m.PrinterName + "\".";
                     }
                     IPAddress ip;
@@ -1291,6 +1761,11 @@ namespace UsbLanPrinterBridge.UI
 "     Use device id \"local_printer\". If your POS page is served over HTTPS you must use the https endpoint,\n" +
 "     and install the bridge certificate on the client (Tools → Export ePOS HTTPS certificate) so it is trusted.\n" +
 "     The bridge converts the ePOS-Print XML to ESC/POS, so any generic ESC/POS printer works.\n\n" +
+"Emergency: tick \"No cut\" on a printer's row (or select rows and press F8, or use the tray menu) to remove every cutter\n" +
+"command from every job to that printer, whatever the app or driver asked for, feeding the paper to the tear bar instead.\n" +
+"Use it when a cutter is jammed or broken. It applies at once, only to that printer, and is saved immediately.\n\n" +
+"The \"Printer actions\" tab under the log shows each ticket as it went to the printer, what the job contained, the cuts\n" +
+"removed, and what Windows reports about the printer: offline, paper out, cover open, paused, or jobs piling up in its queue.\n\n" +
 "Tip: to skip virtual addresses entirely, use this PC's own address or 0.0.0.0 in the \"LAN address\" column.";
             MessageBox.Show(this, text, "How to connect devices to the bridge", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
@@ -1310,6 +1785,7 @@ namespace UsbLanPrinterBridge.UI
             if (disposing)
             {
                 Logger.EntryAdded -= OnLogEntry;
+                PrinterActionLog.ActionAdded -= OnPrinterAction;
                 _manager.ListenerChanged -= OnListenerChanged;
                 if (_timer != null) _timer.Dispose();
                 if (_tray != null) _tray.Dispose();

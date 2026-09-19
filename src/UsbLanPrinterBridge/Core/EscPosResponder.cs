@@ -50,6 +50,17 @@ namespace UsbLanPrinterBridge.Core
         /// <summary>Number of queries answered so far (diagnostics).</summary>
         public int QueriesAnswered { get; private set; }
 
+        /// <summary>The last few queries answered, by name, oldest first (diagnostics for the printer actions log).</summary>
+        public List<string> RecentQueries { get { return _recent; } }
+        private readonly List<string> _recent = new List<string>();
+        private const int RecentLimit = 12;
+
+        private void Note(string query)
+        {
+            if (_recent.Count >= RecentLimit) _recent.RemoveAt(0);
+            _recent.Add(query);
+        }
+
         private enum Match { Complete, Incomplete, No }
 
         public void Process(byte[] input, int offset, int count)
@@ -111,6 +122,7 @@ namespace UsbLanPrinterBridge.Core
                 byte n = At(pos + 2);
                 if (n < 1 || n > 4) return Match.No;
                 Reply(StatusFor(n));
+                Note("DLE EOT " + n + " (" + (n == 1 ? "printer" : n == 2 ? "offline" : n == 3 ? "error" : "paper") + " status)");
                 consumed = 3;
                 return Match.Complete;
             }
@@ -123,6 +135,7 @@ namespace UsbLanPrinterBridge.Core
             {
                 if (Available(pos) < 3) return Match.Incomplete;
                 ReplyPrinterId(At(pos + 2));
+                Note("GS I " + At(pos + 2) + " (printer id" + (At(pos + 2) >= 65 ? ", model name" : "") + ")");
                 consumed = 3;
                 return Match.Complete;
             }
@@ -131,6 +144,7 @@ namespace UsbLanPrinterBridge.Core
             {
                 if (Available(pos) < 3) return Match.Incomplete;
                 Reply(0x14); Reply(0x00); Reply(0x00); Reply(0x0F);
+                Note("GS a (auto status back)");
                 consumed = 3;
                 return Match.Complete;
             }
@@ -139,6 +153,7 @@ namespace UsbLanPrinterBridge.Core
             {
                 if (Available(pos) < 3) return Match.Incomplete;
                 Reply(0x00); // paper present / drawer low
+                Note("GS r " + At(pos + 2) + " (paper/drawer status)");
                 consumed = 3;
                 return Match.Complete;
             }
@@ -158,6 +173,7 @@ namespace UsbLanPrinterBridge.Core
                 Reply(0x22);
                 for (int i = pos + 7; i < pos + total; i++) Reply(At(i));
                 Reply(0x00);
+                Note("GS ( H (process id echo)");
                 consumed = total;
                 return Match.Complete;
             }

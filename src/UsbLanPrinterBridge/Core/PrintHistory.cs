@@ -18,8 +18,10 @@ namespace UsbLanPrinterBridge.Core
         public long Bytes { get; set; }
         /// <summary>"Printed", or the reason it did not.</summary>
         public string Status { get; set; }
-        /// <summary>Readable text pulled out of the ESC/POS stream, so the log shows what was actually printed.</summary>
+        /// <summary>Readable text pulled out of the ESC/POS stream, flattened to one line for the grid and the CSV.</summary>
         public string Preview { get; set; }
+        /// <summary>The ticket as it would look on paper, line by line, with markers for images, barcodes, QR codes and the cut.</summary>
+        public string Ticket { get; set; }
 
         public bool Failed { get { return !string.Equals(Status, "Printed", StringComparison.OrdinalIgnoreCase); } }
 
@@ -75,7 +77,8 @@ namespace UsbLanPrinterBridge.Core
                 Path = path ?? "",
                 Bytes = length,
                 Status = status ?? "Printed",
-                Preview = ExtractText(data, length, PreviewChars)
+                Preview = ExtractText(data, length, PreviewChars),
+                Ticket = SafeRender(data, length)
             };
 
             lock (Gate)
@@ -90,6 +93,12 @@ namespace UsbLanPrinterBridge.Core
             Action<PrintRecord> handler = RecordAdded;
             if (handler != null) { try { handler(record); } catch { } }
             return record;
+        }
+
+        private static string SafeRender(byte[] data, int length)
+        {
+            try { return EscPosTicketText.Render(data, length); }
+            catch { return ""; }
         }
 
         /// <summary>

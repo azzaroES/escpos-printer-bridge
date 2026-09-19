@@ -21,6 +21,8 @@ namespace UsbLanPrinterBridge
         public bool Minimized { get; set; }
         /// <summary>Headless: generate/export the HTTPS public certificate to this path and exit.</summary>
         public string ExportCertPath { get; set; }
+        /// <summary>Tick NO CUT (the emergency cutter bypass) on every mapping at start-up, whatever the saved configuration says.</summary>
+        public bool NoCut { get; set; }
 
         public static StartupOptions Parse(string[] args)
         {
@@ -32,6 +34,7 @@ namespace UsbLanPrinterBridge
                 if (a == "autostart") { o.AutoStart = true; o.Minimized = true; }
                 else if (a == "no-elevate" || a == "noelevate") o.NoElevate = true;
                 else if (a == "minimized" || a == "tray") o.Minimized = true;
+                else if (a == "no-cut" || a == "nocut") o.NoCut = true;
                 else if (a == "export-cert") { o.ExportCertPath = (i + 1 < arr.Length) ? arr[++i] : "UsbLanPrinterBridge.cer"; }
             }
             return o;
