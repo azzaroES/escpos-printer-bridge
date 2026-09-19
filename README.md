@@ -69,11 +69,13 @@ Build instructions are in each app's README: [Windows](windows/README.md), [Andr
 
 * The Windows bridge prints from **Loyverse** by IP address alone, and passes its 60-check self-test suite.
 * Every reply the bridges send was captured from a real **Epson TM-T20II**, not taken from documentation.
-* The Android app runs on a real phone (Android 10) and serves 9100 and 8080; its responder passes 24 checks and
-  its raster, footer, NO CUT and ticket code 53 desktop checks.
+* The Android app runs on a real phone (Android 10), starts from its screen, and forwards tickets from a PC to an
+  Epson TM printer on the LAN, with NO CUT verified on that path; its responder passes 24 checks and its raster,
+  footer, NO CUT and ticket code 53 desktop checks.
 
-Still waiting on hardware: printing through the Android app's Sunmi, Bluetooth and USB-OTG routes, its print
-service, and running the Windows exe on ARM64 Windows. Each README says precisely what is and is not tested.
+Still waiting on hardware: printing through the Android app's Sunmi, Bluetooth and USB-OTG routes, a page printed
+through its print service, and running the Windows exe on ARM64 Windows. Each README says precisely what is and is
+not tested.
 
 ## License
 
