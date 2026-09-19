@@ -5,6 +5,8 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
@@ -12,33 +14,40 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
-import android.widget.CheckBox;
+import android.widget.CompoundButton;
 import android.widget.EditText;
+import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import com.usblanbridge.core.BluetoothPrintTarget;
+import com.usblanbridge.core.License;
 import com.usblanbridge.core.Log;
 import com.usblanbridge.core.NetUtil;
 import com.usblanbridge.core.NetworkPrinterScanner;
+import com.usblanbridge.core.PrintHistory;
 import com.usblanbridge.core.PrinterScanner;
 import com.usblanbridge.core.RawServer;
 import com.usblanbridge.core.TestReceipt;
+import com.usblanbridge.print.PrintServiceStatus;
 
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -47,40 +56,94 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Single-screen control panel: pick the printer, start sharing, see the address to type into POS software.
- * The layout is built in code so the app carries no layout XML and no AndroidX dependency.
+ * The control panel: a coloured header with the address to type into POS software and a live status, one big
+ * Start/Stop button, then cards for the printer route, the NO CUT emergency switch, the last tickets as they
+ * went to the printer, options, the Android print service, the ticket footer and the log.
+ *
+ * Built in code from framework widgets only, so the app carries no layout XML and no AndroidX dependency and
+ * still runs on Android 5. Cards are rounded white panels on a light grey background; the route is chosen with
+ * chips and only the controls of the chosen route are shown.
  */
 public final class MainActivity extends Activity {
 
     private static final String ACTION_USB_PERMISSION = "com.usblanbridge.USB_PERMISSION";
 
+    // palette
+    private static final int PRIMARY = 0xFF1D4ED8;
+    private static final int PRIMARY_DARK = 0xFF1E40AF;
+    private static final int ON_PRIMARY_MUTED = 0xCCFFFFFF;
+    private static final int GREEN = 0xFF15803D;
+    private static final int GREEN_BG = 0xFFDCFCE7;
+    private static final int RED = 0xFFB91C1C;
+    private static final int RED_TEXT = 0xFF991B1B;
+    private static final int RED_BG = 0xFFFEE2E2;
+    private static final int AMBER = 0xFFB45309;
+    private static final int CARD = 0xFFFFFFFF;
+    private static final int TEXT = 0xFF111827;
+    private static final int MUTED = 0xFF6B7280;
+    private static final int CHIP = 0xFFE5E7EB;
+    private static final int LINE = 0xFFE5E7EB;
+    private static final int LOG_BG = 0xFF0F172A;
+    private static final int LOG_TEXT = 0xFFCBD5E1;
+
+    /** Printing routes offered as chips, kept in step with ROUTE_LABELS. */
+    private static final String[] ROUTE_MODES = {
+            Prefs.TARGET_USB, Prefs.TARGET_SUNMI, Prefs.TARGET_BLUETOOTH, Prefs.TARGET_TCP
+    };
+    private static final String[] ROUTE_LABELS = {"USB", "Built-in", "Bluetooth", "Network"};
+    private static final int MAX_TICKETS = 8;
+
     private Prefs prefs;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final List<UsbDevice> usbDevices = new ArrayList<>();
+    private boolean resumed;
 
+    // header
+    private TextView statusPill;
     private TextView addressView;
-    private TextView statusView;
-    /** Printing routes offered in the dropdown, kept in step with TARGET_LABELS. */
-    private static final String[] TARGET_MODES = {
-            Prefs.TARGET_USB, Prefs.TARGET_SUNMI, Prefs.TARGET_BLUETOOTH, Prefs.TARGET_TCP
-    };
-    private static final String[] TARGET_LABELS = {
-            "USB printer over OTG",
-            "Built-in thermal printer, Sunmi and similar",
-            "Bluetooth printer, paired",
-            "Forward to a network printer"
-    };
+    private TextView addressHint;
+    private TextView eposView;
+    private Button btnStartStop;
 
+    // printer card
+    private final TextView[] chips = new TextView[ROUTE_MODES.length];
+    private final View[] routePanels = new View[ROUTE_MODES.length];
+    private int route;
     private Spinner deviceSpinner;
-    private Spinner targetSpinner;
+    private TextView btChosen;
     private EditText tcpHost;
     private EditText tcpPort;
+
+    // emergency
+    private Switch noCutSwitch;
+    private TextView noCutText;
+
+    // tickets
+    private LinearLayout ticketsBox;
+    private TextView ticketsEmpty;
+
+    // options
     private EditText rawPort;
     private EditText eposPort;
-    private CheckBox statusReplies;
-    private CheckBox autoStart;
+    private Switch statusReplies;
+    private Switch autoStart;
+
+    // print service, footer, log
+    private TextView printServiceView;
+    private TextView footerView;
+    private EditText licenceKey;
     private TextView logView;
     private ScrollView logScroll;
+    private Button logToggle;
+
+    private final Runnable ticker = new Runnable() {
+        @Override
+        public void run() {
+            if (!resumed) return;
+            refreshStatus();
+            ui.postDelayed(this, 2000);
+        }
+    };
 
     private final Log.Listener logListener = new Log.Listener() {
         @Override
@@ -89,6 +152,19 @@ public final class MainActivity extends Activity {
                 @Override
                 public void run() {
                     appendLog(line);
+                }
+            });
+        }
+    };
+
+    private final PrintHistory.Listener historyListener = new PrintHistory.Listener() {
+        @Override
+        public void onRecord(PrintHistory.Record record) {
+            ui.post(new Runnable() {
+                @Override
+                public void run() {
+                    refreshTickets();
+                    refreshStatus();
                 }
             });
         }
@@ -127,22 +203,35 @@ public final class MainActivity extends Activity {
         }
 
         Log.addListener(logListener);
+        PrintHistory.addListener(historyListener);
         appendLog(Log.snapshot());
         requestNotificationPermissionIfNeeded();
         refreshDevices();
+        refreshTickets();
         refreshStatus();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
         refreshDevices();
         refreshStatus();
+        ui.removeCallbacks(ticker);
+        ui.postDelayed(ticker, 2000);
+    }
+
+    @Override
+    protected void onPause() {
+        resumed = false;
+        ui.removeCallbacks(ticker);
+        super.onPause();
     }
 
     @Override
     protected void onDestroy() {
         Log.removeListener(logListener);
+        PrintHistory.removeListener(historyListener);
         try {
             unregisterReceiver(usbReceiver);
         } catch (Exception ignored) {
@@ -155,197 +244,590 @@ public final class MainActivity extends Activity {
     private View buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        int pad = dp(16);
-        root.setPadding(pad, pad, pad, pad);
+        root.setPadding(dp(14), dp(12), dp(14), dp(24));
 
-        TextView title = new TextView(this);
-        title.setText("USB LAN Printer Bridge");
-        title.setTextSize(20);
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        root.addView(title);
+        root.addView(buildHeader());
+        root.addView(buildActions());
+        root.addView(buildPrinterCard());
+        root.addView(buildEmergencyCard());
+        root.addView(buildTicketsCard());
+        root.addView(buildOptionsCard());
+        root.addView(buildPrintServiceCard());
+        root.addView(buildFooterCard());
+        root.addView(buildLogCard());
 
-        addressView = new TextView(this);
-        addressView.setTextSize(16);
-        addressView.setPadding(0, dp(8), 0, dp(4));
-        root.addView(addressView);
+        ScrollView outer = new ScrollView(this);
+        outer.setFillViewport(true);
+        outer.addView(root, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return outer;
+    }
 
-        statusView = new TextView(this);
-        statusView.setPadding(0, 0, 0, dp(12));
-        root.addView(statusView);
+    /** The coloured header: title, live status pill, and the address to type into POS software. */
+    private View buildHeader() {
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
+        header.setBackground(rounded(PRIMARY, 16));
+        header.setPadding(dp(18), dp(16), dp(18), dp(18));
+        header.setElevation(dp(2));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(12);
+        header.setLayoutParams(lp);
 
-        root.addView(label("Printer"));
-        targetSpinner = new Spinner(this);
-        ArrayAdapter<String> targetAdapter =
-                new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, TARGET_LABELS);
-        targetAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        targetSpinner.setAdapter(targetAdapter);
-        root.addView(targetSpinner);
+        LinearLayout titleRow = new LinearLayout(this);
+        titleRow.setOrientation(LinearLayout.HORIZONTAL);
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = text("Printer Bridge", 20, Color.WHITE, true);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        titleRow.addView(title);
+        statusPill = text("Stopped", 12, TEXT, true);
+        statusPill.setPadding(dp(10), dp(4), dp(10), dp(4));
+        statusPill.setBackground(rounded(CHIP, 999));
+        statusPill.setContentDescription("status_pill");
+        titleRow.addView(statusPill);
+        header.addView(titleRow);
 
-        LinearLayout detectRow = new LinearLayout(this);
-        detectRow.setOrientation(LinearLayout.HORIZONTAL);
-        detectRow.addView(button("Detect printers", new View.OnClickListener() {
+        TextView hint = text("Add this printer in your POS app as", 13, ON_PRIMARY_MUTED, false);
+        hint.setPadding(0, dp(14), 0, dp(2));
+        header.addView(hint);
+
+        addressView = text("—", 26, Color.WHITE, true);
+        addressView.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        addressView.setContentDescription("address");
+        addressView.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                detectPrinters();
+                copyToClipboard("Printer address", addressView.getText().toString(), "Address copied");
             }
-        }));
-        root.addView(detectRow);
-        selectTargetMode(prefs.getTargetMode());
+        });
+        header.addView(addressView);
 
-        root.addView(label("USB printer"));
-        deviceSpinner = new Spinner(this);
-        root.addView(deviceSpinner);
+        addressHint = text("Tap to copy. Raw printing, works from an IP address alone.", 12, ON_PRIMARY_MUTED, false);
+        header.addView(addressHint);
 
-        LinearLayout usbButtons = new LinearLayout(this);
-        usbButtons.setOrientation(LinearLayout.HORIZONTAL);
-        usbButtons.addView(button("Refresh", new View.OnClickListener() {
+        eposView = text("", 12, ON_PRIMARY_MUTED, false);
+        eposView.setPadding(0, dp(8), 0, 0);
+        eposView.setTypeface(Typeface.MONOSPACE);
+        eposView.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                refreshDevices();
+                String s = eposView.getText().toString();
+                int at = s.indexOf("http");
+                if (at >= 0) copyToClipboard("ePOS endpoint", s.substring(at), "ePOS address copied");
             }
-        }));
-        usbButtons.addView(button("Grant USB access", new View.OnClickListener() {
+        });
+        header.addView(eposView);
+        return header;
+    }
+
+    /** One big Start/Stop button and the test print beside it. */
+    private View buildActions() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(12);
+        row.setLayoutParams(lp);
+
+        btnStartStop = primaryButton("Start sharing", GREEN, new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                requestUsbPermission();
+                if (BridgeService.isRunning()) stop();
+                else start();
             }
-        }));
-        root.addView(usbButtons);
+        });
+        btnStartStop.setContentDescription("btn_start_stop");
+        btnStartStop.setLayoutParams(new LinearLayout.LayoutParams(0, dp(52), 2f));
+        row.addView(btnStartStop);
 
-        LinearLayout tcpRow = new LinearLayout(this);
-        tcpRow.setOrientation(LinearLayout.HORIZONTAL);
-        tcpHost = edit(prefs.getTcpHost(), InputType.TYPE_CLASS_TEXT, 3f);
-        tcpPort = edit(String.valueOf(prefs.getTcpPort()), InputType.TYPE_CLASS_NUMBER, 1f);
-        tcpRow.addView(tcpHost);
-        tcpRow.addView(tcpPort);
-        root.addView(tcpRow);
-
-        LinearLayout scanRow = new LinearLayout(this);
-        scanRow.setOrientation(LinearLayout.HORIZONTAL);
-        scanRow.addView(button("Scan network for printers", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                scanNetwork();
-            }
-        }));
-        root.addView(scanRow);
-
-        LinearLayout btRow = new LinearLayout(this);
-        btRow.setOrientation(LinearLayout.HORIZONTAL);
-        btRow.addView(button("Choose Bluetooth printer", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                chooseBluetoothPrinter();
-            }
-        }));
-        root.addView(btRow);
-
-        root.addView(label("Ports"));
-        LinearLayout portRow = new LinearLayout(this);
-        portRow.setOrientation(LinearLayout.HORIZONTAL);
-        rawPort = edit(String.valueOf(prefs.getRawPort()), InputType.TYPE_CLASS_NUMBER, 1f);
-        eposPort = edit(String.valueOf(prefs.getEposPort()), InputType.TYPE_CLASS_NUMBER, 1f);
-        portRow.addView(labelled("Raw", rawPort));
-        portRow.addView(labelled("ePOS", eposPort));
-        root.addView(portRow);
-
-        statusReplies = new CheckBox(this);
-        statusReplies.setText("Answer printer status queries");
-        statusReplies.setChecked(prefs.isStatusReplies());
-        root.addView(statusReplies);
-
-        autoStart = new CheckBox(this);
-        autoStart.setText("Start automatically after reboot");
-        autoStart.setChecked(prefs.isAutoStart());
-        root.addView(autoStart);
-
-        LinearLayout actions = new LinearLayout(this);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        actions.setPadding(0, dp(12), 0, dp(8));
-        actions.addView(button("Start", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                start();
-            }
-        }));
-        actions.addView(button("Stop", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                stop();
-            }
-        }));
-        actions.addView(button("Test print", new View.OnClickListener() {
+        Button test = outlineButton("Test print", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 testPrint();
             }
-        }));
-        root.addView(actions);
+        });
+        test.setContentDescription("btn_test");
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, dp(52), 1f);
+        tlp.leftMargin = dp(8);
+        test.setLayoutParams(tlp);
+        row.addView(test);
+        return row;
+    }
+
+    private View buildPrinterCard() {
+        LinearLayout card = card("Printer");
+
+        // Route chips
+        LinearLayout chipRow = new LinearLayout(this);
+        chipRow.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < ROUTE_MODES.length; i++) {
+            final int index = i;
+            TextView chip = chip(ROUTE_LABELS[i]);
+            chip.setContentDescription("route_" + ROUTE_MODES[i]);
+            chip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    selectRoute(index, true);
+                }
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(40), 1f);
+            lp.rightMargin = i < ROUTE_MODES.length - 1 ? dp(6) : 0;
+            chip.setLayoutParams(lp);
+            chips[i] = chip;
+            chipRow.addView(chip);
+        }
+        card.addView(chipRow);
+
+        // USB
+        LinearLayout usb = panel();
+        deviceSpinner = new Spinner(this);
+        deviceSpinner.setContentDescription("usb_spinner");
+        usb.addView(deviceSpinner);
+        LinearLayout usbButtons = buttonRow(
+                button("Refresh", new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        refreshDevices();
+                    }
+                }),
+                button("Grant USB access", new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        requestUsbPermission();
+                    }
+                }));
+        usb.addView(usbButtons);
+        usb.addView(hintText("A receipt printer on an OTG cable. Android asks once for permission."));
+        routePanels[0] = usb;
+        card.addView(usb);
+
+        // Built-in (Sunmi)
+        LinearLayout sunmi = panel();
+        sunmi.addView(hintText("The terminal's built-in thermal printer, through the vendor's printer service. Tap Detect printers to check it is present and answering."));
+        routePanels[1] = sunmi;
+        card.addView(sunmi);
+
+        // Bluetooth
+        LinearLayout bt = panel();
+        btChosen = text("", 14, TEXT, false);
+        bt.addView(btChosen);
+        bt.addView(buttonRow(button("Choose paired printer", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                chooseBluetoothPrinter();
+            }
+        })));
+        bt.addView(hintText("Pair the printer in Android's Bluetooth settings first. Only paired devices are offered, so no location permission is needed."));
+        routePanels[2] = bt;
+        card.addView(bt);
+
+        // Network
+        LinearLayout tcp = panel();
+        LinearLayout tcpRow = new LinearLayout(this);
+        tcpRow.setOrientation(LinearLayout.HORIZONTAL);
+        tcpHost = edit(prefs.getTcpHost(), "Printer address", InputType.TYPE_CLASS_TEXT, 3f);
+        tcpHost.setContentDescription("field_host");
+        tcpPort = edit(String.valueOf(prefs.getTcpPort()), "Port", InputType.TYPE_CLASS_NUMBER, 1f);
+        tcpPort.setContentDescription("field_port");
+        ((LinearLayout.LayoutParams) tcpPort.getLayoutParams()).leftMargin = dp(8);
+        tcpRow.addView(tcpHost);
+        tcpRow.addView(tcpPort);
+        tcp.addView(tcpRow);
+        Button scan = button("Scan network for printers", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                scanNetwork();
+            }
+        });
+        scan.setContentDescription("btn_scan");
+        tcp.addView(buttonRow(scan));
+        tcp.addView(hintText("Relays every ticket to a printer already on the Wi-Fi. The scan tries ports 9100, 515 and 631 and asks 9100 for the model."));
+        routePanels[3] = tcp;
+        card.addView(tcp);
+
+        Button detect = button("Detect printers on this device", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                detectPrinters();
+            }
+        });
+        detect.setContentDescription("btn_detect");
+        LinearLayout detectRow = buttonRow(detect);
+        ((LinearLayout.LayoutParams) detectRow.getLayoutParams()).topMargin = dp(6);
+        card.addView(detectRow);
+
+        selectRoute(indexOfRoute(prefs.getTargetMode()), false);
+        return card;
+    }
+
+    private View buildEmergencyCard() {
+        LinearLayout card = card(null);
+        card.setBackground(rounded(RED_BG, 14));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        texts.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        texts.addView(text("NO CUT  ·  emergency", 16, RED_TEXT, true));
+        noCutText = text("", 13, RED_TEXT, false);
+        noCutText.setPadding(0, dp(4), dp(8), 0);
+        texts.addView(noCutText);
+        row.addView(texts);
+
+        noCutSwitch = new Switch(this);
+        noCutSwitch.setChecked(prefs.isNoCut());
+        noCutSwitch.setContentDescription("switch_nocut");
+        noCutSwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton b, boolean checked) {
+                // Saved the moment it changes and read on every write, so it applies to the next bytes printed.
+                prefs.setNoCut(checked);
+                if (checked) Log.w("NO CUT switched on: cutter commands are removed from every ticket, "
+                        + prefs.getNoCutFeedLines() + " lines are fed instead.");
+                else Log.i("NO CUT switched off: cutter commands reach the printer again.");
+                toast(checked ? "NO CUT is on. Tear receipts by hand." : "Cutting again.");
+                refreshStatus();
+            }
+        });
+        row.addView(noCutSwitch);
+        card.addView(row);
+        return card;
+    }
+
+    private View buildTicketsCard() {
+        LinearLayout card = card("Last tickets");
+        ticketsEmpty = hintText("Nothing printed yet. Each ticket that goes through the phone is listed here; tap one to see it as it went to the printer.");
+        card.addView(ticketsEmpty);
+        ticketsBox = new LinearLayout(this);
+        ticketsBox.setOrientation(LinearLayout.VERTICAL);
+        card.addView(ticketsBox);
+        card.addView(buttonRow(button("Clear list", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                PrintHistory.clear();
+                refreshTickets();
+            }
+        })));
+        return card;
+    }
+
+    private View buildOptionsCard() {
+        LinearLayout card = card("Options");
+
+        LinearLayout portRow = new LinearLayout(this);
+        portRow.setOrientation(LinearLayout.HORIZONTAL);
+        rawPort = edit(String.valueOf(prefs.getRawPort()), "Raw port", InputType.TYPE_CLASS_NUMBER, 1f);
+        rawPort.setContentDescription("field_raw_port");
+        eposPort = edit(String.valueOf(prefs.getEposPort()), "ePOS port", InputType.TYPE_CLASS_NUMBER, 1f);
+        eposPort.setContentDescription("field_epos_port");
+        portRow.addView(labelled("Raw port (9100)", rawPort));
+        View eposBox = labelled("ePOS port (8080)", eposPort);
+        ((LinearLayout.LayoutParams) eposBox.getLayoutParams()).leftMargin = dp(8);
+        portRow.addView(eposBox);
+        card.addView(portRow);
+        card.addView(hintText("Raw works from an IP address alone. ePOS cannot use port 80 on an unrooted phone, so ePOS clients must include the port in the URL."));
+
+        statusReplies = new Switch(this);
+        statusReplies.setChecked(prefs.isStatusReplies());
+        card.addView(switchRow("Answer printer status queries", "Replies to DLE EOT, GS I and GS ( H as a TM-T20II would, so POS apps do not wait for a USB printer that cannot answer.", statusReplies));
+
+        autoStart = new Switch(this);
+        autoStart.setChecked(prefs.isAutoStart());
+        card.addView(switchRow("Start sharing after a reboot", "The bridge comes back on its own when the phone restarts.", autoStart));
+        return card;
+    }
+
+    private View buildPrintServiceCard() {
+        LinearLayout card = card("Print from any app");
+        printServiceView = text("", 13, MUTED, false);
+        card.addView(printServiceView);
+        card.addView(buttonRow(button("Android print settings", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openPrintSettings();
+            }
+        })));
+        return card;
+    }
+
+    private View buildFooterCard() {
+        LinearLayout card = card("Ticket footer & licence");
+        footerView = text("", 13, MUTED, false);
+        card.addView(footerView);
+        licenceKey = edit(prefs.getLicenseKey(), "Licence key", InputType.TYPE_CLASS_TEXT, 1f);
+        licenceKey.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        card.addView(licenceKey);
+        card.addView(buttonRow(
+                button("Apply key", new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        applyLicence();
+                    }
+                }),
+                button("Copy device ID", new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        copyDeviceId();
+                    }
+                })));
+        return card;
+    }
+
+    private View buildLogCard() {
+        LinearLayout card = card(null);
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        TextView title = text("Log", 15, TEXT, true);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        head.addView(title);
+        Button copy = smallButton("Copy", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyToClipboard("Bridge log", logView.getText().toString(), "Log copied");
+            }
+        });
+        head.addView(copy);
+        logToggle = smallButton("Hide", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean show = logScroll.getVisibility() != View.VISIBLE;
+                logScroll.setVisibility(show ? View.VISIBLE : View.GONE);
+                logToggle.setText(show ? "Hide" : "Show");
+            }
+        });
+        ((LinearLayout.LayoutParams) logToggle.getLayoutParams()).leftMargin = dp(6);
+        head.addView(logToggle);
+        card.addView(head);
 
         logView = new TextView(this);
         logView.setTypeface(Typeface.MONOSPACE);
         logView.setTextSize(11);
-        logView.setBackgroundColor(Color.parseColor("#F5F5F5"));
-        logView.setPadding(dp(6), dp(6), dp(6), dp(6));
+        logView.setTextColor(LOG_TEXT);
+        logView.setPadding(dp(10), dp(8), dp(10), dp(8));
+        logView.setTextIsSelectable(true);
         logScroll = new ScrollView(this);
+        logScroll.setBackground(rounded(LOG_BG, 10));
         logScroll.addView(logView);
-        LinearLayout.LayoutParams logParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        root.addView(logScroll, logParams);
-
-        ScrollView outer = new ScrollView(this);
-        outer.addView(root, new ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return outer;
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220));
+        lp.topMargin = dp(8);
+        logScroll.setLayoutParams(lp);
+        card.addView(logScroll);
+        return card;
     }
 
-    private TextView label(String text) {
+    // ------------------------------------------------------------------ widget helpers
+
+    private GradientDrawable rounded(int color, int radiusDp) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(dp(radiusDp));
+        return d;
+    }
+
+    private GradientDrawable outlined(int strokeColor, int fill, int radiusDp) {
+        GradientDrawable d = rounded(fill, radiusDp);
+        d.setStroke(dp(1), strokeColor);
+        return d;
+    }
+
+    /** A white rounded panel with an optional title, spaced from the next one. */
+    private LinearLayout card(String title) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(rounded(CARD, 14));
+        card.setElevation(dp(1));
+        card.setPadding(dp(16), dp(14), dp(16), dp(14));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(12);
+        card.setLayoutParams(lp);
+        if (title != null) {
+            TextView t = text(title, 15, TEXT, true);
+            t.setPadding(0, 0, 0, dp(8));
+            card.addView(t);
+        }
+        return card;
+    }
+
+    private LinearLayout panel() {
+        LinearLayout p = new LinearLayout(this);
+        p.setOrientation(LinearLayout.VERTICAL);
+        p.setPadding(0, dp(10), 0, 0);
+        p.setVisibility(View.GONE);
+        return p;
+    }
+
+    private TextView text(String s, float sp, int color, boolean bold) {
         TextView t = new TextView(this);
-        t.setText(text);
-        t.setTypeface(Typeface.DEFAULT_BOLD);
-        t.setPadding(0, dp(10), 0, dp(2));
+        t.setText(s);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
         return t;
     }
 
-    private View labelled(String text, View field) {
+    private TextView hintText(String s) {
+        TextView t = text(s, 12, MUTED, false);
+        t.setPadding(0, dp(6), 0, 0);
+        return t;
+    }
+
+    private TextView chip(String label) {
+        TextView c = new TextView(this);
+        c.setText(label);
+        c.setTextSize(13);
+        c.setGravity(Gravity.CENTER);
+        c.setTypeface(Typeface.DEFAULT_BOLD);
+        c.setClickable(true);
+        return c;
+    }
+
+    private Button button(String label, View.OnClickListener onClick) {
+        Button b = new Button(this);
+        b.setText(label);
+        b.setAllCaps(false);
+        b.setTextSize(14);
+        b.setTextColor(TEXT);
+        b.setBackground(rounded(CHIP, 10));
+        b.setStateListAnimator(null);
+        b.setOnClickListener(onClick);
+        b.setLayoutParams(new LinearLayout.LayoutParams(0, dp(44), 1f));
+        return b;
+    }
+
+    private Button smallButton(String label, View.OnClickListener onClick) {
+        Button b = button(label, onClick);
+        b.setTextSize(12);
+        b.setPadding(dp(12), 0, dp(12), 0);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
+        return b;
+    }
+
+    private Button primaryButton(String label, int color, View.OnClickListener onClick) {
+        Button b = button(label, onClick);
+        b.setTextSize(16);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setTextColor(Color.WHITE);
+        b.setBackground(rounded(color, 12));
+        return b;
+    }
+
+    private Button outlineButton(String label, View.OnClickListener onClick) {
+        Button b = button(label, onClick);
+        b.setTextColor(PRIMARY);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setBackground(outlined(PRIMARY, CARD, 12));
+        return b;
+    }
+
+    private LinearLayout buttonRow(Button... buttons) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < buttons.length; i++) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+            if (i > 0) lp.leftMargin = dp(8);
+            buttons[i].setLayoutParams(lp);
+            row.addView(buttons[i]);
+        }
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rlp.topMargin = dp(8);
+        row.setLayoutParams(rlp);
+        return row;
+    }
+
+    private View switchRow(String title, String subtitle, Switch sw) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(12), 0, 0);
+        LinearLayout texts = new LinearLayout(this);
+        texts.setOrientation(LinearLayout.VERTICAL);
+        texts.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        texts.addView(text(title, 14, TEXT, false));
+        if (subtitle != null && !subtitle.isEmpty()) {
+            TextView sub = text(subtitle, 12, MUTED, false);
+            sub.setPadding(0, dp(2), dp(8), 0);
+            texts.addView(sub);
+        }
+        row.addView(texts);
+        row.addView(sw);
+        return row;
+    }
+
+    private View labelled(String label, View field) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
-        TextView t = new TextView(this);
-        t.setText(text);
+        TextView t = text(label, 12, MUTED, false);
+        t.setPadding(0, 0, 0, dp(2));
         box.addView(t);
+        field.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         box.addView(field);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        box.setLayoutParams(lp);
+        box.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         return box;
     }
 
-    private EditText edit(String value, int inputType, float weight) {
+    private EditText edit(String value, String hint, int inputType, float weight) {
         EditText e = new EditText(this);
         e.setText(value);
+        e.setHint(hint);
         e.setInputType(inputType);
         e.setSingleLine(true);
+        e.setTextSize(15);
         e.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, weight));
         return e;
-    }
-
-    private Button button(String text, View.OnClickListener listener) {
-        Button b = new Button(this);
-        b.setText(text);
-        b.setOnClickListener(listener);
-        b.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        return b;
     }
 
     private int dp(int value) {
         return Math.round(getResources().getDisplayMetrics().density * value);
     }
 
+    private void copyToClipboard(String label, String value, String message) {
+        try {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            if (clipboard != null) {
+                clipboard.setPrimaryClip(ClipData.newPlainText(label, value));
+                toast(message);
+                return;
+            }
+        } catch (Exception ignored) {
+        }
+        toast(value);
+    }
+
+    // ------------------------------------------------------------------ routes
+
+    private static int indexOfRoute(String mode) {
+        for (int i = 0; i < ROUTE_MODES.length; i++) if (ROUTE_MODES[i].equals(mode)) return i;
+        return 0;
+    }
+
+    private String selectedTargetMode() {
+        return ROUTE_MODES[route];
+    }
+
+    private void selectTargetMode(String mode) {
+        selectRoute(indexOfRoute(mode), false);
+    }
+
+    private void selectRoute(int index, boolean fromUser) {
+        route = index;
+        for (int i = 0; i < chips.length; i++) {
+            boolean on = i == index;
+            chips[i].setBackground(rounded(on ? PRIMARY : CHIP, 10));
+            chips[i].setTextColor(on ? Color.WHITE : TEXT);
+            if (routePanels[i] != null) routePanels[i].setVisibility(on ? View.VISIBLE : View.GONE);
+        }
+        if (btChosen != null) {
+            String address = prefs.getBluetoothAddress();
+            btChosen.setText(address == null || address.isEmpty() ? "No printer chosen yet." : "Chosen printer: " + address);
+        }
+        if (fromUser) prefs.setTargetMode(ROUTE_MODES[index]);
+    }
+
     // ------------------------------------------------------------------ devices and permissions
 
-    /**
-     * Sweeps the local subnet for printers, because typing an address by hand only helps if you already
-     * know it. Runs off the UI thread; the sweep takes a few seconds.
-     */
     /**
      * Lists paired Bluetooth devices so one can be chosen as the printer.
      * Only paired devices are offered, deliberately: discovery would drag in location permissions.
@@ -399,6 +881,7 @@ public final class MainActivity extends Activity {
                 .show();
     }
 
+    /** Sweeps the local subnet for printers, because typing an address by hand only helps if you already know it. */
     private void scanNetwork() {
         final NetworkPrinterScanner.Range range = NetworkPrinterScanner.localRange();
         if (range == null) {
@@ -460,20 +943,6 @@ public final class MainActivity extends Activity {
                 .show();
     }
 
-    private String selectedTargetMode() {
-        int i = (targetSpinner == null) ? -1 : targetSpinner.getSelectedItemPosition();
-        return (i >= 0 && i < TARGET_MODES.length) ? TARGET_MODES[i] : Prefs.TARGET_USB;
-    }
-
-    private void selectTargetMode(String mode) {
-        for (int i = 0; i < TARGET_MODES.length; i++) {
-            if (TARGET_MODES[i].equals(mode)) {
-                targetSpinner.setSelection(i);
-                return;
-            }
-        }
-    }
-
     /**
      * Reports every printing route this particular device offers, and picks the best one automatically.
      * A phone will usually only have USB, while a Sunmi terminal has its printer wired in.
@@ -498,6 +967,7 @@ public final class MainActivity extends Activity {
             }
 
             selectTargetMode(best.targetMode);
+            prefs.setTargetMode(best.targetMode);
             if (Prefs.TARGET_USB.equals(best.targetMode) && best.deviceId.length() > 0) {
                 prefs.setUsbDeviceName(best.deviceId);
                 refreshDevices();
@@ -585,6 +1055,7 @@ public final class MainActivity extends Activity {
         prefs.setEposPort(parsePort(eposPort.getText().toString(), 8080));
         prefs.setStatusReplies(statusReplies.isChecked());
         prefs.setAutoStart(autoStart.isChecked());
+        prefs.setNoCut(noCutSwitch.isChecked());
         UsbDevice device = selectedDevice();
         if (device != null) prefs.setUsbDeviceName(device.getDeviceName());
     }
@@ -610,6 +1081,7 @@ public final class MainActivity extends Activity {
         Intent intent = new Intent(this, BridgeService.class).setAction(BridgeService.ACTION_START);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent);
         else startService(intent);
+        statusPill.setText("Starting…");
         ui.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -632,10 +1104,11 @@ public final class MainActivity extends Activity {
     /** Sends a receipt through the phone's own raw port, so it exercises the whole path a client would use. */
     private void testPrint() {
         if (!BridgeService.isRunning()) {
-            toast("Start the bridge first.");
+            toast("Start sharing first.");
             return;
         }
         final int port = parsePort(rawPort.getText().toString(), 9100);
+        toast("Sending a test receipt…");
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -660,23 +1133,155 @@ public final class MainActivity extends Activity {
         }, "test-print").start();
     }
 
+    private void openPrintSettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_PRINT_SETTINGS));
+        } catch (Exception e) {
+            toast("This Android build has no print settings screen.");
+        }
+    }
+
+    private void applyLicence() {
+        String key = licenceKey.getText().toString().trim();
+        if (key.isEmpty()) {
+            prefs.setLicenseKey("");
+            refreshStatus();
+            toast("No licence key. The footer is printed again.");
+            return;
+        }
+        License.Info info = License.inspect(key);
+        if (info == null) {
+            toast("That key is not valid.");
+            return;
+        }
+        String device = DeviceId.get(this);
+        if (!info.allows(device)) {
+            toast("This key is for other devices. Send this device's ID (" + DeviceId.pretty(device) + ") to get a key for it.");
+            return;
+        }
+        prefs.setLicenseKey(key);
+        refreshStatus();
+        toast("Licensed to " + info.licensee + ". The footer is off.");
+    }
+
+    private void copyDeviceId() {
+        String id = DeviceId.pretty(DeviceId.get(this));
+        copyToClipboard("Device ID", id, "Copied: " + id);
+    }
+
+    // ------------------------------------------------------------------ status, tickets, log
+
     private void refreshStatus() {
+        printServiceView.setText(PrintServiceStatus.describe(this));
+        footerView.setText(Branding.describe(this));
+        noCutText.setText(NoCut.describe(this));
+        if (noCutSwitch.isChecked() != prefs.isNoCut()) noCutSwitch.setChecked(prefs.isNoCut());
+
         String ip = NetUtil.getLanAddress();
         int raw = parsePort(rawPort.getText().toString(), 9100);
-        addressView.setText(ip == null
-                ? "No Wi-Fi connection"
-                : "Add this printer as  " + ip + "  port " + raw);
+        int epos = parsePort(eposPort.getText().toString(), 8080);
+        addressView.setText(ip == null ? "No Wi-Fi" : ip + ":" + raw);
+        addressHint.setText(ip == null
+                ? "Join a Wi-Fi network; POS devices reach the phone over it."
+                : "Tap to copy. Raw printing, works from an IP address alone.");
+        eposView.setText(ip == null || !prefs.isEposEnabled() ? "" : "ePOS: http://" + ip + ":" + epos + "/cgi-bin/epos/service.cgi");
 
         RawServer server = BridgeService.rawServer();
-        if (BridgeService.isRunning() && server != null) {
-            statusView.setText("Running. " + server.getJobsCompleted() + " job(s), "
-                    + RawServer.formatBytes(server.getBytesReceived()) + ", "
-                    + server.getActiveClients() + " connected.");
-            statusView.setTextColor(Color.parseColor("#1B7F1B"));
+        boolean running = BridgeService.isRunning() && server != null;
+        String status = BridgeService.status();
+        boolean error = !running && status != null && status.startsWith("Error");
+        if (running) {
+            long jobs = server.getJobsCompleted();
+            int clients = server.getActiveClients();
+            statusPill.setText("● Running · " + jobs + " job" + (jobs == 1 ? "" : "s") + (clients > 0 ? " · " + clients + " connected" : ""));
+            statusPill.setBackground(rounded(GREEN_BG, 999));
+            statusPill.setTextColor(GREEN);
+            btnStartStop.setText("Stop sharing");
+            btnStartStop.setBackground(rounded(RED, 12));
         } else {
-            statusView.setText(BridgeService.status());
-            statusView.setTextColor(Color.GRAY);
+            statusPill.setText(error ? "Error" : "Stopped");
+            statusPill.setBackground(rounded(error ? RED_BG : CHIP, 999));
+            statusPill.setTextColor(error ? RED : MUTED);
+            btnStartStop.setText("Start sharing");
+            btnStartStop.setBackground(rounded(GREEN, 12));
         }
+        if (error) {
+            // Only shown when the service failed: the log line is the detail.
+            btnStartStop.setText("Start sharing (last attempt failed, see the log)");
+        }
+    }
+
+    private void refreshTickets() {
+        ticketsBox.removeAllViews();
+        List<PrintHistory.Record> all = PrintHistory.snapshot();
+        ticketsEmpty.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
+        int shown = 0;
+        for (int i = all.size() - 1; i >= 0 && shown < MAX_TICKETS; i--, shown++) {
+            final PrintHistory.Record r = all.get(i);
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setPadding(0, dp(8), 0, dp(8));
+            row.setClickable(true);
+            row.setBackground(rounded(i % 2 == 0 ? 0xFFF9FAFB : CARD, 8));
+
+            String clock = r.timeText().substring(11);
+            TextView head = text(clock + "   " + r.source + "   " + RawServer.formatBytes(r.bytes) + "   " + r.path, 13, TEXT, true);
+            row.addView(head);
+
+            String first = firstLine(r.ticket == null || r.ticket.isEmpty() ? r.preview : r.ticket);
+            TextView body = text((r.failed() ? r.status : "Printed") + (first.isEmpty() ? "" : "  ·  " + first), 12, r.failed() ? RED : MUTED, false);
+            row.addView(body);
+
+            row.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    showTicket(r);
+                }
+            });
+            ticketsBox.addView(row);
+            View line = new View(this);
+            line.setBackgroundColor(LINE);
+            line.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)));
+            ticketsBox.addView(line);
+        }
+    }
+
+    private static String firstLine(String s) {
+        if (s == null) return "";
+        for (String l : s.split("\n")) {
+            String t = l.trim();
+            if (!t.isEmpty()) return t.length() > 60 ? t.substring(0, 60) + "…" : t;
+        }
+        return "";
+    }
+
+    /** The ticket as it went to the printer, in a monospace dialog that can be copied. */
+    private void showTicket(final PrintHistory.Record r) {
+        final String ticket = (r.ticket == null || r.ticket.isEmpty())
+                ? (r.preview == null || r.preview.isEmpty() ? "(nothing printable: a status exchange, a drawer pulse or an image)" : r.preview)
+                : r.ticket;
+        TextView t = new TextView(this);
+        t.setTypeface(Typeface.MONOSPACE);
+        t.setTextSize(12);
+        t.setTextColor(TEXT);
+        t.setText(ticket);
+        t.setPadding(dp(16), dp(12), dp(16), dp(12));
+        t.setTextIsSelectable(true);
+        HorizontalScrollView h = new HorizontalScrollView(this);
+        h.addView(t);
+        ScrollView s = new ScrollView(this);
+        s.addView(h);
+        new AlertDialog.Builder(this)
+                .setTitle("Ticket  " + r.timeText().substring(11) + "  ·  " + r.source + "  ·  " + r.status)
+                .setView(s)
+                .setPositiveButton("Close", null)
+                .setNeutralButton("Copy", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        copyToClipboard("Ticket", ticket, "Ticket copied");
+                    }
+                })
+                .show();
     }
 
     private void appendLog(String line) {

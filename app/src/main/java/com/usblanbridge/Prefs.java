@@ -107,6 +107,48 @@ public final class Prefs {
         return p.getInt("tcpPort", 9100);
     }
 
+    /** True once the user has saved a network printer address, as opposed to the built-in default. */
+    public boolean hasTcpHost() {
+        return p.contains("tcpHost");
+    }
+
+    /** Licence key that removes the printed footer; empty when none has been entered. */
+    public String getLicenseKey() {
+        return p.getString("licenseKey", "");
+    }
+
+    public void setLicenseKey(String v) {
+        p.edit().putString("licenseKey", v == null ? "" : v.trim()).apply();
+    }
+
+    /** Emergency switch: remove every cutter command from every ticket. Read on every write, so it applies at once. */
+    public boolean isNoCut() {
+        return p.getBoolean("noCut", false);
+    }
+
+    public void setNoCut(boolean v) {
+        p.edit().putBoolean("noCut", v).apply();
+    }
+
+    /** Lines fed in place of each removed cut, so the paper reaches the tear bar. */
+    public int getNoCutFeedLines() {
+        int v = p.getInt("noCutFeed", 4);
+        return v < 0 ? 0 : v > 30 ? 30 : v;
+    }
+
+    public void setNoCutFeedLines(int v) {
+        p.edit().putInt("noCutFeed", v).apply();
+    }
+
+    /** Random device id used only on ROMs that provide no ANDROID_ID. */
+    public String getFallbackDeviceId() {
+        return p.getString("deviceId", "");
+    }
+
+    public void setFallbackDeviceId(String v) {
+        p.edit().putString("deviceId", v).apply();
+    }
+
     public void setTcpPort(int v) {
         p.edit().putInt("tcpPort", v).apply();
     }

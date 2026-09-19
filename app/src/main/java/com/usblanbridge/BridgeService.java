@@ -10,6 +10,8 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
+import android.net.nsd.NsdManager;
+import android.net.nsd.NsdServiceInfo;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
@@ -24,6 +26,7 @@ import com.usblanbridge.core.RawServer;
 import com.usblanbridge.core.SunmiPrintTarget;
 import com.usblanbridge.core.TcpPrintTarget;
 import com.usblanbridge.core.UsbPrintTarget;
+import com.usblanbridge.print.PrinterCatalog;
 
 import java.util.HashMap;
 
@@ -53,6 +56,10 @@ public final class BridgeService extends Service {
     private WifiManager.WifiLock wifiLock;
     private PowerManager.WakeLock wakeLock;
     private volatile String statusText = "Stopped";
+    private volatile String currentId;
+    private NsdManager nsd;
+    private NsdManager.RegistrationListener nsdListener;
+    private volatile String advertisedName;
 
     public static boolean isRunning() {
         BridgeService s = instance;
@@ -67,6 +74,24 @@ public final class BridgeService extends Service {
     public static RawServer rawServer() {
         BridgeService s = instance;
         return s == null ? null : s.rawServer;
+    }
+
+    /** The target the running bridge prints to, footer included, or null when stopped. */
+    public static PrintTarget currentTarget() {
+        BridgeService s = instance;
+        return s == null ? null : s.target;
+    }
+
+    /** Catalogue id of the printer the running bridge uses, so the print service can share its connection. */
+    public static String currentPrinterId() {
+        BridgeService s = instance;
+        return s == null ? null : s.currentId;
+    }
+
+    /** The name this phone announces itself under on the network, or null. Lets the print service skip itself. */
+    public static String advertisedName() {
+        BridgeService s = instance;
+        return s == null ? null : s.advertisedName;
     }
 
     @Override
@@ -114,8 +139,10 @@ public final class BridgeService extends Service {
         Prefs prefs = new Prefs(this);
         shutdownServers();
 
-        target = buildTarget(prefs);
+        // Footer outside, NO CUT inside: the footer is placed before the cut, then the cut is replaced by a feed.
+        target = Branding.wrap(this, NoCut.wrap(this, buildTarget(prefs)));
         Log.i("Sharing printer: " + target.getName());
+        if (prefs.isNoCut()) Log.w("NO CUT is on: cutter commands are removed from every ticket.");
 
         rawServer = new RawServer(target, prefs.isStatusReplies(), prefs.getModelName(),
                 prefs.getIdleTimeoutMs(), prefs.getRawPort());
@@ -132,6 +159,7 @@ public final class BridgeService extends Service {
         }
 
         acquireLocks();
+        advertise(prefs.getRawPort());
 
         String ip = NetUtil.getLanAddress();
         statusText = (ip == null ? "No Wi-Fi address" : ip + ":" + prefs.getRawPort())
@@ -143,13 +171,16 @@ public final class BridgeService extends Service {
 
     private PrintTarget buildTarget(Prefs prefs) throws Exception {
         if (Prefs.TARGET_TCP.equals(prefs.getTargetMode())) {
-            return new TcpPrintTarget(prefs.getTcpHost(), prefs.getTcpPort());
+            String host = prefs.getTcpHost().trim();
+            currentId = PrinterCatalog.NET + host + ":" + prefs.getTcpPort();
+            return new TcpPrintTarget(host, prefs.getTcpPort());
         }
 
         if (Prefs.TARGET_SUNMI.equals(prefs.getTargetMode())) {
             SunmiPrintTarget sunmi = new SunmiPrintTarget(this);
             sunmi.connect();   // binds and validates, throwing a readable reason if either fails
             sunmiTarget = sunmi;
+            currentId = PrinterCatalog.SUNMI;
             return sunmi;
         }
 
@@ -161,6 +192,7 @@ public final class BridgeService extends Service {
             BluetoothPrintTarget bt = new BluetoothPrintTarget(this, address);
             bt.connect();
             bluetoothTarget = bt;
+            currentId = PrinterCatalog.BT + address;
             return bt;
         }
 
@@ -186,7 +218,67 @@ public final class BridgeService extends Service {
         UsbPrintTarget usb = new UsbPrintTarget(manager, chosen);
         usb.open(); // fails fast with a readable reason if permission is missing
         usbTarget = usb;
+        currentId = PrinterCatalog.USB + chosen.getDeviceName();
         return usb;
+    }
+
+    // ------------------------------------------------------------------ announcing on the network
+
+    /**
+     * Announces the raw port with DNS-SD as "_pdl-datastream._tcp", the standard name for port 9100 printing.
+     * Another phone running this app then lists this printer in its Print menu, and CUPS on Linux or macOS
+     * finds it too. Failure here is logged and otherwise harmless: typing the address still works.
+     */
+    private void advertise(int port) {
+        try {
+            nsd = (NsdManager) getSystemService(Context.NSD_SERVICE);
+            if (nsd == null) return;
+            NsdServiceInfo info = new NsdServiceInfo();
+            info.setServiceName("Printer bridge " + Build.MODEL);
+            info.setServiceType("_pdl-datastream._tcp.");
+            info.setPort(port);
+            try {
+                info.setAttribute("ty", target.getName());
+                info.setAttribute("pdl", "application/octet-stream");
+            } catch (Throwable ignored) {
+            }
+            nsdListener = new NsdManager.RegistrationListener() {
+                @Override
+                public void onServiceRegistered(NsdServiceInfo registered) {
+                    advertisedName = registered.getServiceName();
+                    Log.i("Announced on the network as \"" + advertisedName + "\".");
+                }
+
+                @Override
+                public void onRegistrationFailed(NsdServiceInfo i, int code) {
+                    Log.w("Could not announce the printer on the network (code " + code + ").");
+                }
+
+                @Override
+                public void onServiceUnregistered(NsdServiceInfo i) {
+                }
+
+                @Override
+                public void onUnregistrationFailed(NsdServiceInfo i, int code) {
+                }
+            };
+            nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, nsdListener);
+        } catch (Throwable t) {
+            Log.w("Could not announce the printer on the network: " + t);
+            nsdListener = null;
+        }
+    }
+
+    private void unadvertise() {
+        NsdManager.RegistrationListener l = nsdListener;
+        nsdListener = null;
+        advertisedName = null;
+        if (l != null && nsd != null) {
+            try {
+                nsd.unregisterService(l);
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     private void acquireLocks() {
@@ -222,6 +314,8 @@ public final class BridgeService extends Service {
     }
 
     private void shutdownServers() {
+        unadvertise();
+        currentId = null;
         if (rawServer != null) {
             rawServer.stop();
             rawServer = null;
