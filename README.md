@@ -175,12 +175,14 @@ printer.
 
 | Path | Status |
 |---|---|
-| App, foreground service, listening on 9100 and 8080 | verified on a real phone (Android 10) |
+| App, foreground service, listening on 9100 and 8080 | verified on a real phone (Ulefone Armor 9E, Android 10) |
+| The new screen: start from the UI, route chips, NO CUT switch | verified on that phone |
 | ESC/POS responder | 24 checks against bytes captured from a real Epson TM-T20II |
 | Raster encoder, ticket footer, NO CUT filter, ticket renderer, licence check | 53 desktop checks |
 | Network scan | logic verified against a live LAN, where it identified a TM-T20II from its `GS I 67` reply |
-| Forwarding to a network printer | **not yet confirmed end to end from a phone** |
-| Print service (the phone's Print menu) | built and manifest-verified, **not yet exercised on a phone** |
+| Forwarding to a network printer | verified from that phone to an Epson TM printer on the LAN, test receipt and a raw ticket from a PC |
+| NO CUT on a real ticket | verified on that path: the log names the `GS V 66 0` removed and the 4-line feed sent instead |
+| Print service (the phone's Print menu) | registered with Android and offers its printer to the Print menu; **a page printed through it not yet checked** |
 | Sunmi built-in printer | written to the published interface and guarded, **not yet run on a Sunmi terminal** |
 | Bluetooth printers | **not yet run against a Bluetooth printer** |
 | USB printer over OTG | **not yet run with a USB printer attached** |

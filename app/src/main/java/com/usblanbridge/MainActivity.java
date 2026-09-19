@@ -1171,44 +1171,48 @@ public final class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ status, tickets, log
 
+    /** Runs every two seconds; it only touches a view whose content actually changed, so an idle screen stays idle. */
     private void refreshStatus() {
-        printServiceView.setText(PrintServiceStatus.describe(this));
-        footerView.setText(Branding.describe(this));
-        noCutText.setText(NoCut.describe(this));
+        setText(printServiceView, PrintServiceStatus.describe(this));
+        setText(footerView, Branding.describe(this));
+        setText(noCutText, NoCut.describe(this));
         if (noCutSwitch.isChecked() != prefs.isNoCut()) noCutSwitch.setChecked(prefs.isNoCut());
 
         String ip = NetUtil.getLanAddress();
         int raw = parsePort(rawPort.getText().toString(), 9100);
         int epos = parsePort(eposPort.getText().toString(), 8080);
-        addressView.setText(ip == null ? "No Wi-Fi" : ip + ":" + raw);
-        addressHint.setText(ip == null
+        setText(addressView, ip == null ? "No Wi-Fi" : ip + ":" + raw);
+        setText(addressHint, ip == null
                 ? "Join a Wi-Fi network; POS devices reach the phone over it."
                 : "Tap to copy. Raw printing, works from an IP address alone.");
-        eposView.setText(ip == null || !prefs.isEposEnabled() ? "" : "ePOS: http://" + ip + ":" + epos + "/cgi-bin/epos/service.cgi");
+        setText(eposView, ip == null || !prefs.isEposEnabled() ? "" : "ePOS: http://" + ip + ":" + epos + "/cgi-bin/epos/service.cgi");
 
         RawServer server = BridgeService.rawServer();
         boolean running = BridgeService.isRunning() && server != null;
         String status = BridgeService.status();
         boolean error = !running && status != null && status.startsWith("Error");
+        int state = running ? 1 : error ? 2 : 0;
         if (running) {
             long jobs = server.getJobsCompleted();
             int clients = server.getActiveClients();
-            statusPill.setText("● Running · " + jobs + " job" + (jobs == 1 ? "" : "s") + (clients > 0 ? " · " + clients + " connected" : ""));
-            statusPill.setBackground(rounded(GREEN_BG, 999));
-            statusPill.setTextColor(GREEN);
-            btnStartStop.setText("Stop sharing");
-            btnStartStop.setBackground(rounded(RED, 12));
+            setText(statusPill, "● Running · " + jobs + " job" + (jobs == 1 ? "" : "s") + (clients > 0 ? " · " + clients + " connected" : ""));
         } else {
-            statusPill.setText(error ? "Error" : "Stopped");
-            statusPill.setBackground(rounded(error ? RED_BG : CHIP, 999));
-            statusPill.setTextColor(error ? RED : MUTED);
-            btnStartStop.setText("Start sharing");
-            btnStartStop.setBackground(rounded(GREEN, 12));
+            setText(statusPill, error ? "Error" : "Stopped");
         }
-        if (error) {
-            // Only shown when the service failed: the log line is the detail.
-            btnStartStop.setText("Start sharing (last attempt failed, see the log)");
+        setText(btnStartStop, running ? "Stop sharing" : error ? "Start sharing (last attempt failed, see the log)" : "Start sharing");
+        if (state != shownState) {
+            shownState = state;
+            statusPill.setBackground(rounded(running ? GREEN_BG : error ? RED_BG : CHIP, 999));
+            statusPill.setTextColor(running ? GREEN : error ? RED : MUTED);
+            btnStartStop.setBackground(rounded(running ? RED : GREEN, 12));
         }
+    }
+
+    private int shownState = -1;
+
+    private static void setText(TextView view, String text) {
+        CharSequence current = view.getText();
+        if (current == null ? text != null : !current.toString().equals(text)) view.setText(text);
     }
 
     private void refreshTickets() {
