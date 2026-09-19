@@ -36,6 +36,11 @@ bytes captured from a genuine Epson TM-T20II, including the `GS ( H` process-id 
 to confirm a job finished. Without that reply, SDK-based apps report the printer as not found. Because the ePOS
 XML is converted to ESC/POS by the bridge, any generic ESC/POS printer works, not just an Epson.
 
+Both apps also carry a **NO CUT** emergency switch, which strips every cutter command from every ticket to a
+printer (per printer on Windows) and feeds the paper to the tear bar instead, for a jammed or broken cutter; and
+both show **each ticket as it went to the printer**, line by line, in their logs. The Android app is also an
+Android print service, so the phone's own Print menu lists its printers.
+
 ## Repository layout
 
 The two apps share a protocol but no code, one being C# and the other Java, so each is a complete project on its
@@ -62,12 +67,13 @@ Build instructions are in each app's README: [Windows](windows/README.md), [Andr
 
 ## What has been verified
 
-* The Windows bridge prints from **Loyverse** by IP address alone, and passes its 49-check self-test suite.
+* The Windows bridge prints from **Loyverse** by IP address alone, and passes its 60-check self-test suite.
 * Every reply the bridges send was captured from a real **Epson TM-T20II**, not taken from documentation.
-* The Android app runs on a real phone and serves 9100 and 8080; its responder passes 24 checks.
+* The Android app runs on a real phone (Android 10) and serves 9100 and 8080; its responder passes 24 checks and
+  its raster, footer, NO CUT and ticket code 53 desktop checks.
 
-Still waiting on hardware: printing through the Android app's Sunmi, Bluetooth and USB-OTG routes, and running the
-Windows exe on ARM64 Windows. Each README says precisely what is and is not tested.
+Still waiting on hardware: printing through the Android app's Sunmi, Bluetooth and USB-OTG routes, its print
+service, and running the Windows exe on ARM64 Windows. Each README says precisely what is and is not tested.
 
 ## License
 

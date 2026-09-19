@@ -206,8 +206,12 @@ namespace UsbLanPrinterBridge.Core
 
             Logger.Info("Bridge started: " + label + "  →  \"" + mapping.PrinterName + "\"");
 
+            // The ePOS endpoints print through the same per-printer NO CUT filter as the raw port.
             if (EnableEposServers && mapping.EposEnabled)
-                StartEposServers(mapping, ip, listener.Target);
+            {
+                BridgeListener captured = listener;
+                StartEposServers(mapping, ip, new NoCutPrintTarget(listener.Target, () => captured.Mapping.NoCut));
+            }
 
             return StartOutcome.Ok("Listening on " + ip + ":" + mapping.Port);
         }

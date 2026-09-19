@@ -48,6 +48,18 @@ namespace UsbLanPrinterBridge.Tests
             Run("EscPos responder: GS ( H split across chunks still answered", Responder_ProcessIdSplit);
             Run("EscPos responder: QR print data (GS ( k) passes through untouched", Responder_QrPassesThrough);
 
+            Run("No cut: every cutter command is removed and replaced by a feed", NoCut_RemovesCuts);
+            Run("No cut: cut bytes inside image, graphics and QR payloads are left alone", NoCut_PayloadsSurvive);
+            Run("No cut: output identical wherever the TCP read splits the stream", NoCut_SplitAnywhere);
+            Run("No cut: a stream without cuts passes through byte for byte (incl. 256 KB random)", NoCut_PassThrough);
+            Run("No cut: wrapper follows the switch mid-job", NoCut_WrapperFollowsSwitch);
+            Run("No cut: per printer, end to end through two listeners, toggled while running", NoCut_Listener);
+            Run("Ticket text: a job renders as the ticket looks on paper", Ticket_Renders);
+            Run("Job summary: describes what a job told the printer", Summary_Describes);
+            Run("Job summary: spots PCL/PostScript/ZPL jobs sent to a receipt printer", Summary_ForeignFormat);
+            Run("Printer actions log: records, counts errors, writes the daily file", Actions_Log);
+            Run("Printer status: XPS writer is ready; an unknown printer is reported once", Status_Probe);
+
             Run("Listener: one connection = one job", Listener_SingleJob);
             Run("Listener: idle timeout splits jobs on a kept-open connection", Listener_IdleSplit);
             Run("Listener: idle timeout 0 waits for disconnect", Listener_NoIdle);
@@ -504,6 +516,358 @@ namespace UsbLanPrinterBridge.Tests
             }
         }
 
+        // ------------------------------------------------------------------ no cut
+
+        private static readonly byte[] Cut4 = { 0x1D, 0x56, 0x42, 0x00 };   // GS V 66 0: feed and partial cut
+        private static readonly byte[] Cut3 = { 0x1D, 0x56, 0x01 };         // GS V 1: partial cut
+
+        private static byte[] Feed(int lines) { return Bytes(0x1B, 0x64, lines); }
+
+        private static byte[] RunCutFilter(byte[] input, int feedLines)
+        {
+            var f = new EscPosCutFilter { FeedLines = feedLines };
+            f.Filter(input, 0, input.Length);
+            byte[] a = Slice(f.Output, f.OutputLength);
+            f.Flush();
+            byte[] b = Slice(f.Output, f.OutputLength);
+            return Concat(a, b);
+        }
+
+        private static void NoCut_RemovesCuts()
+        {
+            byte[] input = Concat(
+                Ascii("One\n"), Cut4,
+                Ascii("Two\n"), Cut3,
+                Ascii("Three\n"), Bytes(0x1B, 0x69),          // ESC i
+                Ascii("Four\n"), Bytes(0x1B, 0x6D),           // ESC m
+                Ascii("Five\n"), Bytes(0x1D, 0x56, 0x00),     // GS V 0 full cut
+                Ascii("Six\n"), Bytes(0x1D, 0x56, 0x31),      // GS V 49
+                Ascii("Seven\n"), Bytes(0x1D, 0x56, 0x41, 0x10)); // GS V 65 16 feed and full cut
+            var f = new EscPosCutFilter { FeedLines = 4 };
+            int events = 0;
+            f.CutRemoved += name => events++;
+            f.Filter(input, 0, input.Length);
+            byte[] expected = Concat(
+                Ascii("One\n"), Feed(4), Ascii("Two\n"), Feed(4), Ascii("Three\n"), Feed(4), Ascii("Four\n"), Feed(4),
+                Ascii("Five\n"), Feed(4), Ascii("Six\n"), Feed(4), Ascii("Seven\n"), Feed(4));
+            CheckEqual(expected, Slice(f.Output, f.OutputLength), "all seven cut forms replaced by ESC d 4");
+            Check(f.CutsRemoved == 7 && events == 7, "seven cuts counted and reported, got " + f.CutsRemoved + "/" + events);
+            f.Flush();
+            Check(f.OutputLength == 0, "nothing held back at the end");
+
+            CheckEqual(Concat(Ascii("A\n"), Feed(3)), RunCutFilter(Concat(Ascii("A\n"), Cut4, Cut4), 3), "two cuts in a row give one feed");
+            CheckEqual(Ascii("A\n"), RunCutFilter(Concat(Ascii("A\n"), Cut4), 0), "feed 0 removes the cut and adds nothing");
+            byte[] initOnly = Concat(Bytes(0x1B, 0x40), Bytes(0x1B, 0x64, 0x02), Cut4);
+            CheckEqual(Concat(Bytes(0x1B, 0x40), Bytes(0x1B, 0x64, 0x02)), RunCutFilter(initOnly, 4), "a cut with nothing printed before it gets no feed");
+            CheckEqual(Concat(Ascii("A\n"), Feed(4), Bytes(0x1B, 0x70, 0x00, 0x19, 0xFA)), RunCutFilter(Concat(Ascii("A\n"), Cut4, Bytes(0x1B, 0x70, 0x00, 0x19, 0xFA)), 4), "drawer pulse after the cut is kept");
+        }
+
+        private static void NoCut_PayloadsSurvive()
+        {
+            byte[] raster = Concat(Bytes(0x1D, 0x76, 0x30, 0x00, 0x02, 0x00, 0x02, 0x00), Cut4);          // 2 bytes x 2 rows, payload is a cut
+            byte[] qr = Concat(Bytes(0x1D, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x50), Bytes(0x1D, 0x56));       // GS ( k, payload holds GS V
+            byte[] bitImage = Concat(Bytes(0x1B, 0x2A, 0x00, 0x04, 0x00), Cut4);                          // ESC * 0, 4 columns, payload is a cut
+            byte[] graphics = Concat(Bytes(0x1D, 0x28, 0x4C, 0x04, 0x00), Cut4);                          // GS ( L, payload is a cut
+            byte[] big = Concat(Bytes(0x1D, 0x38, 0x4C, 0x03, 0x00, 0x00, 0x00), Cut3);                   // GS 8 L, payload is a cut
+            byte[] barcode = Concat(Bytes(0x1D, 0x6B, 0x49, 0x04), Cut4);                                 // GS k 73 (length-prefixed), payload is a cut
+            byte[] input = Concat(Ascii("Logo\n"), raster, qr, bitImage, graphics, big, barcode, Cut4);
+            byte[] expected = Concat(Ascii("Logo\n"), raster, qr, bitImage, graphics, big, barcode, Feed(4));
+            CheckEqual(expected, RunCutFilter(input, 4), "payload bytes untouched, only the real cut replaced");
+
+            // The same stream with the switch off through the wrapper must be byte-identical.
+            var memory = new MemoryPrintTarget();
+            using (IPrintJob job = new NoCutPrintTarget(memory, () => false).StartJob("t")) { job.Write(input, 0, input.Length); job.Complete(); }
+            CheckEqual(input, memory.Jobs[0], "switch off: nothing changes");
+        }
+
+        private static void NoCut_SplitAnywhere()
+        {
+            byte[] raster = Concat(Bytes(0x1D, 0x76, 0x30, 0x00, 0x02, 0x00, 0x02, 0x00), Cut4);
+            byte[] qr = Concat(Bytes(0x1D, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x50), Bytes(0x1D, 0x56));
+            byte[] stream = Concat(Bytes(0x1B, 0x40), Ascii("Shop\n"), raster, qr, Bytes(0x1B, 0x70, 0x00, 0x19, 0xFA),
+                Bytes(0x1B, 0x64, 0x02), Cut4, Ascii("Kitchen\n"), Cut3, Bytes(0x10, 0x14, 0x01, 0x00, 0x05), Bytes(0x10, 0x41), Ascii("x"), Bytes(0x1B, 0x69));
+            byte[] reference = RunCutFilter(stream, 4);
+            Check(reference.Length == stream.Length - Cut4.Length - Cut3.Length - 2 + 3 * 3, "reference removed three cuts and added three feeds");
+            for (int cut = 1; cut < stream.Length; cut++)
+            {
+                var f = new EscPosCutFilter { FeedLines = 4 };
+                f.Filter(stream, 0, cut);
+                byte[] a = Slice(f.Output, f.OutputLength);
+                f.Filter(stream, cut, stream.Length - cut);
+                byte[] b = Slice(f.Output, f.OutputLength);
+                f.Flush();
+                byte[] c = Slice(f.Output, f.OutputLength);
+                CheckEqual(reference, Concat(a, b, c), "split at " + cut);
+            }
+            // Byte by byte, the worst case.
+            var one = new EscPosCutFilter { FeedLines = 4 };
+            var outBytes = new List<byte>();
+            for (int i = 0; i < stream.Length; i++) { one.Filter(stream, i, 1); outBytes.AddRange(Slice(one.Output, one.OutputLength)); }
+            one.Flush(); outBytes.AddRange(Slice(one.Output, one.OutputLength));
+            CheckEqual(reference, outBytes.ToArray(), "byte by byte");
+        }
+
+        private static void NoCut_PassThrough()
+        {
+            byte[] realistic = Concat(
+                Bytes(0x1B, 0x40), Bytes(0x1B, 0x61, 0x01), Bytes(0x1B, 0x21, 0x30), Ascii("SHOP\n"), Bytes(0x1B, 0x21, 0x00),
+                Bytes(0x1D, 0x21, 0x11), Ascii("Total 12.50\n"), Bytes(0x1D, 0x21, 0x00), Bytes(0x1B, 0x74, 0x10), Bytes(0xA9, 0xE9),
+                Bytes(0x1D, 0x48, 0x02), Bytes(0x1D, 0x68, 0x50), Bytes(0x1D, 0x6B, 0x04), Ascii("12345"), Bytes(0x00),
+                Bytes(0x1B, 0x7A, 0x01), Bytes(0x1D, 0x99), Bytes(0x1C, 0x21, 0x00),   // unknown ESC z, unknown GS 0x99, FS !
+                Bytes(0x10, 0x04, 0x01), Bytes(0x10, 0x14, 0x01, 0x00, 0x05), Bytes(0x1B, 0x70, 0x00, 0x32, 0x32), Bytes(0x1B, 0x64, 0x05),
+                Bytes(0x1B, 0x44, 0x08, 0x10, 0x00), Bytes(0x1D, 0x28, 0x45, 0x03, 0x00, 0x01, 0x02, 0x03), Bytes(0x0C), Bytes(0x1B));
+            CheckEqual(realistic, RunCutFilter(realistic, 4), "realistic receipt without cuts is untouched (incl. a trailing lone ESC)");
+
+            var rnd = new Random(1234);
+            var blob = new byte[256 * 1024];
+            rnd.NextBytes(blob);
+            for (int i = 0; i + 1 < blob.Length; i++)
+            {
+                if (blob[i] == 0x1D && blob[i + 1] == 0x56) blob[i + 1] = 0x00;
+                if (blob[i] == 0x1B && (blob[i + 1] == 0x69 || blob[i + 1] == 0x6D)) blob[i + 1] = 0x00;
+            }
+            var f = new EscPosCutFilter { FeedLines = 4 };
+            var collected = new MemoryStream();
+            int pos = 0;
+            while (pos < blob.Length)
+            {
+                int n = Math.Min(blob.Length - pos, 1 + rnd.Next(5000));
+                f.Filter(blob, pos, n);
+                collected.Write(f.Output, 0, f.OutputLength);
+                pos += n;
+            }
+            f.Flush();
+            collected.Write(f.Output, 0, f.OutputLength);
+            CheckEqual(blob, collected.ToArray(), "256 KB of random bytes without cut sequences survive intact");
+            Check(f.CutsRemoved == 0, "no cuts reported in random data");
+        }
+
+        private static void NoCut_WrapperFollowsSwitch()
+        {
+            var memory = new MemoryPrintTarget();
+            bool on = false;
+            var wrapped = new NoCutPrintTarget(memory, () => on);
+            NoCutSettings.FeedLines = 4;
+            long removedBefore = NoCutSettings.CutsRemoved;
+            using (IPrintJob job = wrapped.StartJob("mid-job"))
+            {
+                byte[] a = Concat(Ascii("A\n"), Cut4);
+                job.Write(a, 0, a.Length);
+                on = true;
+                byte[] b = Concat(Ascii("B\n"), Cut4);
+                job.Write(b, 0, b.Length);
+                byte[] half = Bytes(0x1D, 0x56);   // half a cut, held back
+                job.Write(half, 0, half.Length);
+                on = false;
+                byte[] c = Concat(Bytes(0x42, 0x00), Ascii("C\n"), Cut4);   // completes the held cut: released unchanged since the switch is off
+                job.Write(c, 0, c.Length);
+                job.Complete();
+            }
+            byte[] expected = Concat(Ascii("A\n"), Cut4, Ascii("B\n"), Feed(4), Bytes(0x1D, 0x56), Bytes(0x42, 0x00), Ascii("C\n"), Cut4);
+            CheckEqual(expected, memory.Jobs[0], "only the part written while the switch was on is filtered");
+            Check(NoCutSettings.CutsRemoved == removedBefore + 1, "global counter went up by one");
+            Check(wrapped.Name == memory.Name, "wrapper keeps the name");
+            Check(ReferenceEquals(NoCutPrintTarget.Unwrap(wrapped), memory), "unwrap returns the inner target");
+        }
+
+        /// <summary>NO CUT is per printer: two bridges, one with the switch on, get the same receipt and only one loses its cut.</summary>
+        private static void NoCut_Listener()
+        {
+            NoCutSettings.FeedLines = 4;
+            byte[] receipt = Concat(Bytes(0x1B, 0x40), Ascii("Receipt 1\n\n"), Bytes(0x10, 0x04, 0x01), Cut4);
+            using (var noCut = new Harness(true, 1500))
+            using (var cuts = new Harness(true, 1500))
+            {
+                noCut.Mapping.NoCut = true;      // ticked while running, exactly what the grid does
+                cuts.Mapping.NoCut = false;
+                foreach (Harness h in new[] { noCut, cuts })
+                {
+                    using (TcpClient c = h.Connect())
+                    using (NetworkStream ns = c.GetStream())
+                    {
+                        ns.Write(receipt, 0, receipt.Length);
+                        Check(ns.ReadByte() == 0x16, "status query still answered");
+                    }
+                    Check(h.WaitForJobs(1, 5000), "job arrived");
+                    Check(h.Listener.JobsCompleted == 1, "job counted");
+                }
+                CheckEqual(Concat(Bytes(0x1B, 0x40), Ascii("Receipt 1\n\n"), Feed(4)), noCut.Target.Jobs[0], "the NO CUT printer gets a feed instead of the cut");
+                CheckEqual(Concat(Bytes(0x1B, 0x40), Ascii("Receipt 1\n\n"), Cut4), cuts.Target.Jobs[0], "the other printer still gets its cut");
+
+                // Untick while the bridge runs: the next receipt on the same listener keeps its cut.
+                // (Read the status reply before closing: closing with an unread reply makes the client's stack send a
+                // reset, and a reset can discard data the server has not read yet. Real POS apps read their replies.)
+                noCut.Mapping.NoCut = false;
+                using (TcpClient c = noCut.Connect())
+                using (NetworkStream ns = c.GetStream())
+                {
+                    ns.Write(receipt, 0, receipt.Length);
+                    Check(ns.ReadByte() == 0x16, "status query answered on the second connection");
+                }
+                Check(noCut.WaitForJobs(2, 5000), "second job arrived");
+                CheckEqual(Concat(Bytes(0x1B, 0x40), Ascii("Receipt 1\n\n"), Cut4), noCut.Target.Jobs[1], "after unticking, the cut goes through again");
+            }
+            List<PrinterAction> actions = PrinterActionLog.Snapshot();
+            Check(actions.Exists(a => a.What.StartsWith("Cut removed") && a.Detail.Contains("GS V 66 0")), "the printer actions log names the removed cut");
+            Check(actions.Exists(a => a.What.StartsWith("Sent ") && a.Detail.Contains("line") && a.Detail.Contains("init") && a.HasTicket && a.Ticket.Contains("Receipt 1")), "the printer actions log describes the job and carries the ticket text");
+            Check(actions.Exists(a => a.What.StartsWith("Answered 1 printer query") && a.Detail.Contains("DLE EOT 1")), "the printer actions log lists the answered query");
+        }
+
+        private static void Ticket_Renders()
+        {
+            byte[] job = Concat(
+                Bytes(0x1B, 0x40), Bytes(0x1B, 0x61, 0x01), Ascii("ACME STORE\n"), Bytes(0x1B, 0x61, 0x00), Ascii("Total   12.50\r\n"),
+                Bytes(0x1D, 0x76, 0x30, 0x00, 0x02, 0x00, 0x02, 0x00), Cut4,                                // raster 16x2, payload is a cut
+                Bytes(0x1D, 0x28, 0x6B, 0x09, 0x00, 0x31, 0x50, 0x30), Ascii("HELLO!"),                   // QR store data
+                Bytes(0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30),                                    // QR print
+                Bytes(0x1D, 0x6B, 0x04), Ascii("12345"), Bytes(0x00),                                      // barcode, NUL-terminated
+                Bytes(0x1D, 0x6B, 0x49, 0x03), Ascii("ABC"),                                               // barcode, length-prefixed
+                Bytes(0x1B, 0x70, 0x00, 0x32, 0x32), Bytes(0x1B, 0x64, 0x02),                              // drawer, feed 2
+                Bytes(0x1B, 0x61, 0x02), Ascii("Thanks\n"),                                                // right aligned
+                Cut4);
+            string text = EscPosTicketText.Render(job, job.Length);
+            Console.WriteLine("      ticket:\n" + Indent(text));
+            string[] expected =
+            {
+                new string(' ', 19) + "ACME STORE",
+                "Total   12.50",
+                "[image 16x2]",
+                "[QR data: HELLO!]",
+                "[QR code]",
+                "[barcode: 12345]",
+                "[barcode: ABC]",
+                "[drawer opened]",
+                "",
+                "",
+                new string(' ', 42) + "Thanks",
+                "- - - - - - - - - -  cut  - - - - - - - - - -"
+            };
+            CheckEqual(Encoding.UTF8.GetBytes(string.Join("\n", expected)), Encoding.UTF8.GetBytes(text), "rendered ticket");
+
+            Check(EscPosTicketText.Render(null, 0) == "", "empty job");
+            Check(EscPosTicketText.Render(Bytes(0x10, 0x04, 0x01), 3) == "", "a bare status query renders as nothing");
+            byte[] big = Concat(Ascii("X\n"), Enumerable.Repeat(Ascii("line of text\n"), 2000).SelectMany(b => b).ToArray());
+            string capped = EscPosTicketText.Render(big, big.Length, 500);
+            Check(capped.Length < 600 && capped.Contains("truncated"), "long tickets are capped");
+
+            PrintHistory.Clear();
+            PrintRecord rec = PrintHistory.Add("10.0.0.1:1", "P", "raw 9100", job, job.Length, "Printed");
+            Check(rec.Ticket.Contains("ACME STORE") && rec.Ticket.Contains("[QR data: HELLO!]"), "the print log record carries the ticket");
+
+            PrinterActionLog.Clear();
+            PrinterAction a = PrinterActionLog.Add(ActionLevel.Info, "P", "10.0.0.1:1", "Sent 1 KB", "init; 3 lines", text);
+            Check(a.HasTicket && a.FullText.Contains("      | Total   12.50") && a.FullText.Contains("      | [barcode: 12345]"), "the actions log line carries the ticket, indented");
+            Check(File.ReadAllText(PrinterActionLog.FilePathFor(DateTime.Now)).Contains("| [QR data: HELLO!]"), "the daily file holds the ticket");
+        }
+
+        private static string Indent(string text)
+        {
+            return "        " + text.Replace("\n", "\n        ");
+        }
+
+        // ------------------------------------------------------------------ job summary / actions log / status
+
+        private static void Summary_Describes()
+        {
+            byte[] job = Concat(
+                Bytes(0x1B, 0x40), Bytes(0x1B, 0x61, 0x01), Ascii("ACME STORE\n"), Bytes(0x1D, 0x21, 0x11), Ascii("Total 12.50\n"),
+                Bytes(0x1D, 0x76, 0x30, 0x00, 0x02, 0x00, 0x02, 0x00), Cut4,                     // raster whose payload is a cut
+                Bytes(0x1D, 0x28, 0x6B, 0x06, 0x00, 0x31, 0x50), Ascii("HELL"),                    // QR data (pL = cn fn + 4 bytes)
+                Bytes(0x1D, 0x6B, 0x04), Ascii("12345"), Bytes(0x00),                              // barcode
+                Bytes(0x1B, 0x70, 0x00, 0x32, 0x32), Bytes(0x1B, 0x64, 0x03),                     // drawer, feed
+                Bytes(0x1B, 0x7A, 0x01), Bytes(0x1B, 0x7A, 0x02),                                  // unknown ESC z, twice
+                Bytes(0x1D, 0x28, 0x45, 0x03, 0x00, 0x01, 0x02, 0x03),                            // GS ( E settings
+                Cut4);
+            EscPosJobSummary s = EscPosJobSummary.Analyze(job, job.Length);
+            string text = s.Describe();
+            Console.WriteLine("      summary: " + text);
+            Check(s.Count(EscPosKind.Init) == 1 && s.Count(EscPosKind.Cut) == 1 && s.Count(EscPosKind.Image) == 1, "init, one real cut, one image (payload cut not counted)");
+            Check(s.Count(EscPosKind.Symbol) == 1 && s.Count(EscPosKind.Barcode) == 1 && s.Count(EscPosKind.Drawer) == 1 && s.Count(EscPosKind.Feed) == 1, "QR, barcode, drawer, feed");
+            Check(s.TextLines == 2, "two lines of text, got " + s.TextLines);
+            Check(s.UnknownCommands.Count == 1 && s.UnknownCommands["ESC 0x7A"] == 2, "unknown ESC z counted twice");
+            Check(text.Contains("init") && text.Contains("2 lines of text") && text.Contains("image") && text.Contains("QR") && text.Contains("barcode") && text.Contains("drawer pulse") && text.Contains("cut") && text.Contains("unknown: ESC 0x7A x2"), "description mentions everything: " + text);
+            List<string> problems = s.Problems();
+            Check(problems.Count == 2, "two problems: unknown commands and a settings change, got " + problems.Count);
+            Check(problems.Exists(p => p.Contains("GS ( E")), "settings change flagged");
+            Check(!s.EndedInsideCommand, "complete job");
+
+            byte[] truncated = Concat(Ascii("Hi\n"), Bytes(0x1D, 0x56));
+            EscPosJobSummary t = EscPosJobSummary.Analyze(truncated, truncated.Length);
+            Check(t.EndedInsideCommand && t.Describe().Contains("truncated"), "a job ending inside a command is flagged");
+            Check(EscPosJobSummary.Analyze(null, 0).Describe() == "no printable content", "empty job");
+            Check(EscPosJobSummary.Analyze(Bytes(0x1B, 0x70, 0x00, 0x32, 0x32), 5).Describe() == "drawer pulse", "a bare drawer pulse is described as such");
+        }
+
+        private static void Summary_ForeignFormat()
+        {
+            Check(Format(Ascii("%!PS-Adobe-3.0\n/Helvetica findfont")) == "PostScript", "PostScript");
+            Check(Format(Ascii("%PDF-1.7\n")) == "PDF", "PDF");
+            byte[] pjl = Concat(Bytes(0x1B), Ascii("%-12345X@PJL JOB\n"));
+            Check(Format(pjl).Contains("PJL"), "PJL/PCL");
+            Check(Format(Ascii("^XA^FO50,50^ADN,36,20^FDHello^FS^XZ")).Contains("ZPL"), "ZPL");
+            byte[] escpos = Concat(Bytes(0x1B, 0x40), Ascii("Hello\n"), Cut4);
+            Check(EscPosJobSummary.Analyze(escpos, escpos.Length).ForeignFormat == null, "ESC/POS is not flagged");
+            byte[] bitImage = Concat(Bytes(0x1B, 0x2A, 0x00, 0x02, 0x00, 0xFF, 0xFF));
+            Check(EscPosJobSummary.Analyze(bitImage, bitImage.Length).ForeignFormat == null, "an ESC * bit image is not mistaken for PCL");
+            List<string> problems = EscPosJobSummary.Analyze(pjl, pjl.Length).Problems();
+            Check(problems.Count == 1 && problems[0].Contains("not ESC/POS"), "foreign format is the one problem reported");
+        }
+
+        private static string Format(byte[] data)
+        {
+            return EscPosJobSummary.Analyze(data, data.Length).ForeignFormat ?? "";
+        }
+
+        private static void Actions_Log()
+        {
+            ConfigStore.DataDirectory = Path.Combine(OutDir, "data");
+            PrinterActionLog.Clear();
+            int added = 0;
+            Action<PrinterAction> handler = a => added++;
+            PrinterActionLog.ActionAdded += handler;
+            try
+            {
+                PrinterActionLog.Info("EPSON TM", "192.168.1.55:5000", "Sent 1.2 KB to the printer", "init; 3 lines of text; cut");
+                PrinterActionLog.Warn("EPSON TM", "watch", "Printer reports: Paper out", "Load a new roll.");
+                PrinterActionLog.Error("EPSON TM", "spooler", "Printer stopped accepting data", "The printer is offline (error 1906)");
+                Check(PrinterActionLog.Count == 3 && PrinterActionLog.ErrorCount == 1 && PrinterActionLog.WarningCount == 1, "three records, one error, one warning");
+                Check(added == 3, "event raised for each record");
+                List<PrinterAction> all = PrinterActionLog.Snapshot();
+                Check(all[2].Level == ActionLevel.Error && all[2].Line.Contains("ERROR") && all[2].Line.Contains("[EPSON TM]") && all[2].Line.Contains("offline"), "line format: " + all[2].Line);
+                string file = PrinterActionLog.FilePathFor(DateTime.Now);
+                Check(File.Exists(file), "daily file written: " + file);
+                string content = File.ReadAllText(file);
+                Check(content.Contains("Paper out") && content.Contains("Printer stopped accepting data"), "file holds the records");
+                PrinterActionLog.Clear();
+                Check(PrinterActionLog.Count == 0 && PrinterActionLog.ErrorCount == 0, "clear resets counts");
+            }
+            finally
+            {
+                PrinterActionLog.ActionAdded -= handler;
+            }
+        }
+
+        private static void Status_Probe()
+        {
+            PrinterQueueStatus unknown = PrinterStatusProbe.Query("No Such Printer 12345");
+            Check(!unknown.Available && unknown.Error.Contains("not installed"), "unknown printer: " + unknown.Error);
+            Check(unknown.HasProblem && unknown.Describe().Contains("not installed"), "described as a problem");
+
+            int before = PrinterActionLog.Count;
+            PrinterWatch.Check("No Such Printer 12345", "test");
+            Check(PrinterActionLog.Count == before + 1, "first check logs the missing printer");
+            PrinterWatch.Check("No Such Printer 12345", "test");
+            Check(PrinterActionLog.Count == before + 1, "second check with the same state logs nothing");
+            PrinterWatch.Forget("No Such Printer 12345");
+
+            const string printer = "Microsoft XPS Document Writer";
+            if (!PrinterEnumerator.GetPrinters().Any(p => p.Name == printer)) throw new SkipException("XPS writer not installed");
+            PrinterQueueStatus xps = PrinterStatusProbe.Query(printer);
+            Console.WriteLine("      XPS writer: " + xps.Describe() + " (flags 0x" + xps.StatusFlags.ToString("X") + ", attributes 0x" + xps.Attributes.ToString("X") + ")");
+            Check(xps.Available, "queue opened");
+            Check(!xps.IsPaused, "not paused");
+        }
+
         // ------------------------------------------------------------------ manager
 
         private static BridgeManager NewManager()
@@ -941,12 +1305,15 @@ namespace UsbLanPrinterBridge.Tests
         private static void Config_RoundTrip()
         {
             string path = Path.Combine(OutDir, "roundtrip.xml");
-            var cfg = new BridgeConfig { JobIdleTimeoutMs = 750, AutoFirewallRule = false, AutoStartBridges = true, CloseToTray = false };
-            cfg.Mappings.Add(new MappingConfig { PrinterName = "EPSON TM-T20 Receipt", BindAddress = "192.168.1.200", Port = 9100, Adapter = "Ethernet", EscPosStatusReplies = true, Enabled = true, EposEnabled = true, EposHttpPort = 8008, EposHttpsPort = 8043 });
+            var cfg = new BridgeConfig { JobIdleTimeoutMs = 750, AutoFirewallRule = false, AutoStartBridges = true, CloseToTray = false, NoCutFeedLines = 7 };
+            cfg.Mappings.Add(new MappingConfig { PrinterName = "EPSON TM-T20 Receipt", BindAddress = "192.168.1.200", Port = 9100, Adapter = "Ethernet", EscPosStatusReplies = true, Enabled = true, EposEnabled = true, EposHttpPort = 8008, EposHttpsPort = 8043, NoCut = true });
             cfg.Mappings.Add(new MappingConfig { PrinterName = "Zebra & \"Label\" <x>", BindAddress = "192.168.1.201", Port = 9101, Adapter = "", EscPosStatusReplies = false, Enabled = false });
             ConfigStore.Save(cfg, path);
             BridgeConfig back = ConfigStore.Load(path);
             Check(back.JobIdleTimeoutMs == 750 && !back.AutoFirewallRule && back.AutoStartBridges && !back.CloseToTray, "settings");
+            Check(back.Mappings[0].NoCut && !back.Mappings[1].NoCut && back.NoCutFeedLines == 7, "per-mapping NO CUT switch and the shared feed count round-trip");
+            Check(new BridgeConfig { NoCutFeedLines = 99 }.SanitizedNoCutFeedLines == NoCutSettings.MaxFeedLines && new BridgeConfig { NoCutFeedLines = -3 }.SanitizedNoCutFeedLines == 0, "feed count is clamped");
+            Check(!new MappingConfig().NoCut && ConfigStore.Load(Path.Combine(OutDir, "missing.xml")).NoCutFeedLines == 4, "NO CUT defaults: off, 4 lines");
             Check(back.Mappings.Count == 2, "mapping count");
             Check(back.Mappings[0].Id == cfg.Mappings[0].Id && back.Mappings[1].Id == cfg.Mappings[1].Id, "ids preserved");
             Check(back.Mappings[1].PrinterName == "Zebra & \"Label\" <x>" && back.Mappings[1].Port == 9101 && !back.Mappings[1].Enabled && !back.Mappings[1].EscPosStatusReplies, "mapping 2");

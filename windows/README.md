@@ -13,6 +13,11 @@ pushes the bytes straight into the Windows print queue of the USB printer.
 * Understands POS software that keeps one connection open and sends receipt after receipt.
 * Optional ESC/POS status emulation, so cash-register apps do not hang waiting for a reply the USB printer
   cannot send.
+* **NO CUT emergency switch, per printer**: tick "No cut" on a printer's row and every cutter command is removed
+  from every job to that printer, whatever the POS app or driver asked for, with a feed to the tear bar instead.
+  Applies at once, while running; the other printers keep cutting.
+* **Printer actions tab**: every ticket as it went to the printer, line by line, what each job contained, the
+  cuts removed, and what Windows reports about the printer (offline, paper out, cover open, paused, jobs stuck).
 * Windows Firewall rule, "Start with Windows" (logon task with admin rights), tray icon, log files, print log.
 
 This is the Windows half of [escpos-printer-bridge](https://github.com/azzaroES/escpos-printer-bridge).
@@ -100,8 +105,34 @@ Cross-origin requests are handled: the bridge answers the CORS preflight and set
   bitmaps that could contain those sequences.
 * **Adapter**: which adapter receives the virtual address. *(Auto)* picks the adapter whose subnet contains the address.
 * **Add Windows Firewall rule automatically**: adds an inbound allow rule for the exe on first start.
+* **No cut** (per mapping, emergency): see below. Saved the moment it changes, so a broken cutter stays bypassed after a restart.
 
 Configuration and logs live in `C:\ProgramData\UsbLanPrinterBridge\` (File → Open data folder).
+
+## NO CUT: stop one printer's cutter at once
+
+When a cutter is jammed, broken, or must not cut (a kitchen printer on continuous paper, a printer whose
+blade shreds the roll), tick **No cut** on that printer's row. It is the one column you can change while the
+bridge is running. Other ways to the same switch: select rows and press **F8** or use the *ON for selected* /
+*OFF for selected* buttons under the settings, right-click the tray icon (every printer is listed there with a
+tick), or start the exe with `--no-cut`, which ticks it on every mapping. From that moment, for that printer:
+
+* Every cutter command is removed from every job to it: `GS V` in all its forms (`GS V 0/1/48/49`,
+  `GS V 65/66 n`, the paper-feed-and-cut variants), and the older `ESC i` and `ESC m`. Raw 9100 jobs, ePOS jobs
+  and the test pages all go through the same filter, so it does not matter which way the POS app prints, or
+  which driver on a Windows client generated the job. Printers without the tick keep cutting.
+* Each removed cut is replaced by a short feed (4 lines by default, adjustable, 0 to disable) so the receipt
+  still comes out past the tear bar for tearing by hand. Two cuts in a row give one feed, not two blank strips.
+* It applies immediately, including to a job already streaming on an open connection, and stays on until you
+  untick it. The row's Status reads `NO CUT ·`, the status bar turns red and counts the cuts removed, and each
+  removed cut is listed in the Printer actions tab.
+* Image and QR data are parsed, not pattern-matched. A logo whose pixel bytes happen to spell `GS V` is left
+  alone, because the filter skips image, graphics, barcode and symbol payloads by their declared lengths.
+
+What it cannot do: the bridge only controls the bytes it forwards. A cut triggered inside the printer, by a
+feed button, a DIP switch or a memory switch such as "cut on form feed", is not something software on the PC
+can prevent. If the printer still cuts with No cut on, the Printer actions tab shows the job contained no cut
+command, and the printer's own setup is where to look.
 
 ## Troubleshooting
 
@@ -124,6 +155,13 @@ Configuration and logs live in `C:\ProgramData\UsbLanPrinterBridge\` (File → O
 * **Nothing prints but the job counter increases**: the Windows queue received the job; check the printer queue on the
   bridge PC (paused? offline? wrong printer selected?). Use *Test print → Direct to the printer* to isolate the spooler side.
 * **POS app says "printer offline"**: tick *ESC/POS status replies* for that mapping.
+* **The printer cuts when it must not, or the cutter is jammed**: tick **No cut** on that printer's row. See above.
+* **The printer prints garbage or nothing although jobs arrive**: open the **Printer actions** tab. If it says
+  the job is *not ESC/POS* (PCL, PostScript, PDF, ZPL), the sending device is using the wrong driver. If it lists
+  *unknown commands*, the app speaks another printer's dialect. If Windows reports *Offline*, *Paper out*,
+  *Paused* or *jobs waiting in the queue*, the problem is between Windows and the printer, not in the bridge.
+* **Remove does nothing for some rows**: it removes every selected row, stopping running bridges first after one
+  confirmation. Ctrl-click or Shift-click selects several rows; the Delete key also removes the selection.
 
 ## Android's own "Add printer" needs an ESC/POS print service
 
@@ -143,6 +181,9 @@ There are two ways forward, and the first is far easier:
    ESC/POS over TCP, so the system print dialog starts working. Point the service at the bridge's address on
    port 9100. Check Settings → Printing first, because such a service may already be installed and merely
    disabled.
+
+On a phone that runs the [Android build of this bridge](https://github.com/azzaroES/escpos-printer-bridge/tree/android)
+the problem does not arise: that app is itself a print service, so the phone's Print menu lists its printers directly.
 
 ## Print log and diagnostics
 
@@ -167,6 +208,48 @@ Two switches in the **Log** menu exist for when a device refuses to connect at a
 That second switch is the answer to "the app says it cannot find the printer". Turn it on, try to add the printer
 on the other device, and the log shows which port it really used and what it sent.
 
+### The Printer actions tab
+
+Next to the log at the bottom of the window is a second tab, **Printer actions**, about the printer and the paper
+rather than about addresses and ports. Each row is one thing that happened, with the printer, who caused it, and
+the details; errors are red, warnings orange. Select a row and the pane on the right shows **the ticket as it
+went to the printer**, line by line, as it looks on paper:
+
+```text
+                   ACME STORE
+Total   12.50
+[image 384x120]
+[QR data: https://example.com/r/1234]
+[QR code]
+[barcode: 12345]
+[drawer opened]
+
+- - - - - - - - - -  cut  - - - - - - - - - -
+```
+
+Centred and right-aligned lines are padded to the 48 columns of an 80 mm roll, feeds become blank lines, and
+everything that is not text gets a marker. Image and symbol payloads are skipped by their declared lengths, so
+pixel bytes never show up as garbage. The same rendering is in the Print log window (Ctrl+L) for every job.
+
+The tab records:
+
+* **What each job told the printer**, parsed from the ESC/POS stream: `init; 14 lines of text; image; QR/2D
+  symbol; drawer pulse; cut`. A job that is not ESC/POS at all (PCL, PostScript, PDF, ZPL) is flagged, as are
+  commands the bridge does not recognise, a job that changes the printer's own settings (`GS ( E`), and a job
+  that ends in the middle of a command because a client disconnected early or the idle timeout split a receipt.
+* **Every cut removed by No cut**, naming the command (`GS V 66 0 (feed and cut)`) and the feed sent instead.
+* **The queries answered on the printer's behalf**: `DLE EOT 1`, `GS I 67`, `GS ( H` and the rest, so you can
+  see what a POS app asked before it printed, or when it asked and then never printed.
+* **ePOS elements that were skipped**, and ePOS documents rejected as bad XML.
+* **What Windows says about the printer**: the spooler is asked after every job and every five seconds while a
+  bridge runs, and any change is logged: *Offline*, *Paper out*, *Paper jam*, *Cover open*, *Paused*, *"Use
+  Printer Offline" is ticked*, a printer that is no longer installed, or jobs piling up in the Windows queue
+  because the printer is not taking data. A healthy printer produces one "Printer ready" line and then silence.
+* **Spooler errors** with what they usually mean: the queue cannot be opened, Windows refused to start the job,
+  the printer stopped accepting data after N bytes, the Print Spooler service is not running.
+
+The same rows go to `logs\printer-actions-YYYYMMDD.log`, ticket text included, so they survive restarts.
+
 ## Building
 
 Requires the .NET SDK, version 6 or newer. No Visual Studio needed.
@@ -175,11 +258,17 @@ Requires the .NET SDK, version 6 or newer. No Visual Studio needed.
 build.cmd
 ```
 
-produces `dist\UsbLanPrinterBridge.exe` and runs the self-test harness (`tests\UsbLanPrinterBridge.Tests`, 49 checks),
-which covers the ESC/POS responder, the TCP listener, the manager, the ePOS converter and HTTP/HTTPS server, the config
-store, a real RAW job through winspool (redirected to a file via the XPS writer), the iphlpapi struct layout, and
-renders the main window to `test-output\mainform.png`. Running the harness as administrator additionally adds and
-removes a real address on the loopback adapter; without admin that check expects "access denied" instead.
+produces `dist\UsbLanPrinterBridge.exe` and runs the self-test harness (`tests\UsbLanPrinterBridge.Tests`, 60 checks),
+which covers the ESC/POS responder, the NO CUT filter (every cut form, cut bytes inside image and QR payloads, every
+TCP split point, 256 KB of random data, the switch flipped mid-job, per printer end to end through two listeners),
+the ticket renderer, the job summariser, the printer actions log, the spooler status probe, the TCP listener, the
+manager, the ePOS converter and HTTP/HTTPS server, the config store, a real RAW job through winspool (redirected to a
+file via the XPS writer), the iphlpapi struct layout, and renders the main window to `test-output\mainform.png`.
+Running the harness as administrator additionally adds and removes a real address on the loopback adapter; without
+admin that check expects "access denied" instead.
+
+Command-line switches: `--autostart` (start all bridges, open in the tray), `--minimized`, `--no-elevate`,
+`--no-cut` (tick No cut on every mapping at start-up), `--export-cert <file>`.
 
 The project targets .NET Framework 4.5 through the `Microsoft.NETFramework.ReferenceAssemblies` package, so it
 compiles with the plain .NET SDK and runs on the .NET Framework that ships inside Windows 8 and later.
@@ -199,6 +288,10 @@ LAN client ──TCP 192.168.1.200:9100──▶ BridgeListener ──▶ Spoole
   one, SDK-based apps report the printer as not found.
 * `HttpBridgeServer` serves the ePOS-Print endpoint and returns `status="251658262"`, the same value the real printer sends.
 * `EposPrintConverter` turns the ePOS-Print XML into ESC/POS.
+* `EscPosStreamScanner` walks an ESC/POS stream command by command, skipping image and symbol payloads by their
+  declared lengths. `EscPosCutFilter` (No cut), `EscPosTicketText` (the ticket rendering) and `EscPosJobSummary`
+  (the Printer actions tab) are built on it; `NoCutPrintTarget` wraps every print target with its printer's switch.
+* `PrinterStatusProbe` asks winspool (`GetPrinter` level 2) what Windows thinks of a queue; `PrinterWatch` logs changes.
 * `IpHelperApi` adds the secondary address with `CreateUnicastIpAddressEntry` (runtime only, SkipAsSource, DHCP untouched).
 * `BridgeListener` accepts connections, opens a RAW spooler job on the first byte and closes it on disconnect or idle timeout.
 * `BridgeManager` owns the listeners, the virtual addresses (removed on stop/exit) and the firewall rule.

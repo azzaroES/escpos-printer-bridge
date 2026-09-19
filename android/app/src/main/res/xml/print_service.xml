@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Registers the app with Android's print framework. The settings entry opens the app's own screen. -->
+<print-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:vendor="@string/app_name"
+    android:settingsActivity="com.usblanbridge.MainActivity"
+    android:addPrintersActivity="com.usblanbridge.MainActivity" />

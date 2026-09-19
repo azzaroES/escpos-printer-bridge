@@ -39,6 +39,12 @@ namespace UsbLanPrinterBridge.Core
         /// <summary>Model name reported to clients that ask (GS I 67). Mirrors a real Epson so SDK clients accept the printer.</summary>
         public string EposModelName { get; set; }
 
+        /// <summary>
+        /// Emergency switch for this printer: remove every cutter command from every job sent to it, whatever the
+        /// app or driver asked for. Read on every write, so it can be ticked while the bridge is running.
+        /// </summary>
+        public bool NoCut { get; set; }
+
         public string EndpointText { get { return (string.IsNullOrEmpty(BindAddress) ? "0.0.0.0" : BindAddress) + ":" + Port; } }
 
         public MappingConfig Clone()
@@ -57,6 +63,7 @@ namespace UsbLanPrinterBridge.Core
             AutoFirewallRule = true;
             AutoStartBridges = false;
             CloseToTray = true;
+            NoCutFeedLines = 4;
         }
 
         public List<MappingConfig> Mappings { get; set; }
@@ -69,9 +76,17 @@ namespace UsbLanPrinterBridge.Core
         /// <summary>The window's close button hides to the tray instead of exiting.</summary>
         public bool CloseToTray { get; set; }
 
+        /// <summary>Lines fed in place of each cut removed by a mapping's NO CUT switch, so the receipt reaches the tear bar. 0 = nothing.</summary>
+        public int NoCutFeedLines { get; set; }
+
         public int SanitizedIdleTimeout
         {
             get { return JobIdleTimeoutMs < 0 ? 0 : JobIdleTimeoutMs > 600000 ? 600000 : JobIdleTimeoutMs; }
+        }
+
+        public int SanitizedNoCutFeedLines
+        {
+            get { return NoCutFeedLines < 0 ? 0 : NoCutFeedLines > NoCutSettings.MaxFeedLines ? NoCutSettings.MaxFeedLines : NoCutFeedLines; }
         }
     }
 

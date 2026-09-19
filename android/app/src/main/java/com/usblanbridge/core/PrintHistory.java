@@ -26,7 +26,10 @@ public final class PrintHistory {
         public String path;
         public long bytes;
         public String status;
+        /** Readable text, flattened to one line for the CSV. */
         public String preview;
+        /** The ticket as it would look on paper, line by line, with markers for images, barcodes, QR codes and the cut. */
+        public String ticket;
 
         public boolean failed() {
             return status == null || !status.equalsIgnoreCase("Printed");
@@ -89,6 +92,11 @@ public final class PrintHistory {
         r.bytes = length;
         r.status = status == null ? "Printed" : status;
         r.preview = extractText(data, length, PREVIEW_CHARS);
+        try {
+            r.ticket = TicketText.render(data, length);
+        } catch (Throwable t) {
+            r.ticket = "";
+        }
 
         List<Listener> copy;
         synchronized (RECORDS) {

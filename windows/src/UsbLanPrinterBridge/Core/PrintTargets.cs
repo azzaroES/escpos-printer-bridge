@@ -56,23 +56,37 @@ namespace UsbLanPrinterBridge.Core
 
         private sealed class SpoolerJob : IPrintJob
         {
+            private readonly string _printerName;
+            private readonly string _documentName;
             private IntPtr _handle;
             private bool _completed;
             private bool _failed;
+            private long _bytes;
 
             public uint JobId { get; private set; }
 
             public SpoolerJob(string printerName, string documentName, string outputFile)
             {
-                _handle = RawPrinterHelper.Open(printerName);
+                _printerName = printerName;
+                _documentName = documentName ?? "";
+                try
+                {
+                    _handle = RawPrinterHelper.Open(printerName);
+                }
+                catch (Exception ex)
+                {
+                    PrinterActionLog.Error(printerName, _documentName, "Cannot open the printer queue", Explain(ex));
+                    throw;
+                }
                 try
                 {
                     JobId = RawPrinterHelper.StartRawDocument(_handle, documentName, outputFile);
                 }
-                catch
+                catch (Exception ex)
                 {
                     RawPrinterHelper.Close(_handle);
                     _handle = IntPtr.Zero;
+                    PrinterActionLog.Error(printerName, _documentName, "Windows refused to start the job", Explain(ex));
                     throw;
                 }
             }
@@ -83,10 +97,12 @@ namespace UsbLanPrinterBridge.Core
                 try
                 {
                     RawPrinterHelper.Write(_handle, buffer, offset, count);
+                    _bytes += count;
                 }
-                catch
+                catch (Exception ex)
                 {
                     _failed = true;
+                    PrinterActionLog.Error(_printerName, _documentName, "Printer stopped accepting data after " + _bytes + " bytes", Explain(ex));
                     throw;
                 }
             }
@@ -99,10 +115,17 @@ namespace UsbLanPrinterBridge.Core
                 {
                     RawPrinterHelper.EndRawDocument(_handle);
                 }
+                catch (Exception ex)
+                {
+                    PrinterActionLog.Error(_printerName, _documentName, "Windows could not finish the job", Explain(ex));
+                    throw;
+                }
                 finally
                 {
                     RawPrinterHelper.Close(_handle);
                     _handle = IntPtr.Zero;
+                    // The job is in the Windows queue now; this is the moment to notice a printer that is not taking it.
+                    try { PrinterWatch.Check(_printerName, "spooler"); } catch { }
                 }
             }
 
@@ -113,11 +136,29 @@ namespace UsbLanPrinterBridge.Core
                 try
                 {
                     RawPrinterHelper.AbortDocument(_handle);
+                    PrinterActionLog.Warn(_printerName, _documentName, "Job discarded", _bytes + " bytes had been written to the queue; the job was cancelled and will not print.");
                 }
                 finally
                 {
                     RawPrinterHelper.Close(_handle);
                     _handle = IntPtr.Zero;
+                }
+            }
+
+            /// <summary>Adds what the Win32 error usually means for a receipt printer.</summary>
+            private static string Explain(Exception ex)
+            {
+                string msg = ex.Message;
+                var w = ex as System.ComponentModel.Win32Exception;
+                if (w == null) return msg;
+                switch (w.NativeErrorCode)
+                {
+                    case 1801: return msg + " -> the printer queue does not exist under this name any more. Pick the printer again in the mapping.";
+                    case 5: return msg + " -> access denied: the queue's security settings do not allow this account to print.";
+                    case 1722: case 1723: case 1727: return msg + " -> the Print Spooler service is not running or was restarted. Start it (services.msc) and try again.";
+                    case 6: return msg + " -> the printer handle is no longer valid; the queue may have been deleted or the spooler restarted.";
+                    case 1906: return msg + " -> the printer or port is offline.";
+                    default: return msg;
                 }
             }
 
