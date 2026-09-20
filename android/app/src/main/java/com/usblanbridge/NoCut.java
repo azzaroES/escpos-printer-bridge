@@ -31,6 +31,7 @@ public final class NoCut {
             public void cutRemoved(String printer, String document, String command, int feedLines) {
                 Log.i("NO CUT: " + command + " removed from \"" + document + "\" on " + printer
                         + (feedLines > 0 ? ", fed " + feedLines + " lines instead." : "."));
+                com.usblanbridge.core.EventLog.warning("Cut removed (NO CUT) · " + command + (feedLines > 0 ? " → " + feedLines + "-line feed" : "") + " · " + printer);
             }
         });
     }

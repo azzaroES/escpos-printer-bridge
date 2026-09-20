@@ -1,21 +1,39 @@
 import com.usblanbridge.core.BrandedPrintTarget;
 import com.usblanbridge.core.CutFilter;
+import com.usblanbridge.core.EposDeviceId;
+import com.usblanbridge.core.EventLog;
 import com.usblanbridge.core.FooterInjector;
 import com.usblanbridge.core.License;
 import com.usblanbridge.core.NoCutPrintTarget;
 import com.usblanbridge.core.PrintTarget;
 import com.usblanbridge.core.RasterEncoder;
+import com.usblanbridge.core.TelemetryLog;
 import com.usblanbridge.core.TicketText;
+import com.usblanbridge.core.TlsCertificate;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
+import java.math.BigInteger;
+import java.nio.file.Files;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.Signature;
+import java.security.cert.X509Certificate;
 import java.security.spec.ECGenParameterSpec;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
+import java.util.Date;
+import java.util.List;
 import java.util.Random;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 /**
  * Desktop self-test for the pure-Java parts behind Android's print dialog: the raster encoder that turns a
@@ -63,6 +81,14 @@ public final class CoreSelfTest {
         licenceRoundTrip();
         embeddedPublicKeyIsSet();
         base64RoundTrip();
+
+        derPrimitives();
+        certificateBuildsAndVerifies();
+        certificateMaterialIsReusedAndRemade();
+        certificateServesTls();
+        eposDeviceIdRules();
+        telemetryLogWritesRows();
+        eventLogKeepsNewestFirst();
 
         System.out.println();
         System.out.println("Passed: " + passed + "   Failed: " + failed);
@@ -521,6 +547,187 @@ public final class CoreSelfTest {
         KeyPairGenerator g = KeyPairGenerator.getInstance("EC");
         g.initialize(new ECGenParameterSpec("secp256r1"));
         return Base64.getEncoder().encodeToString(g.generateKeyPair().getPublic().getEncoded());
+    }
+
+    // ------------------------------------------------------------------ certificate, device id, telemetry, events
+
+    private static void derPrimitives() {
+        check("OID 1.2.840.113549.1.1.11 (sha256WithRSA) encodes as in RFC 8017",
+                Arrays.equals(bytes(0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B), TlsCertificate.oid("1.2.840.113549.1.1.11")));
+        check("OID 2.5.29.17 (subjectAltName) encodes as 06 03 55 1D 11",
+                Arrays.equals(bytes(0x06, 0x03, 0x55, 0x1D, 0x11), TlsCertificate.oid("2.5.29.17")));
+        check("short, one-byte and two-byte lengths",
+                Arrays.equals(bytes(0x7F), TlsCertificate.length(127))
+                        && Arrays.equals(bytes(0x81, 0xC8), TlsCertificate.length(200))
+                        && Arrays.equals(bytes(0x82, 0x01, 0x2C), TlsCertificate.length(300)));
+        check("INTEGER 2 is 02 01 02", Arrays.equals(bytes(0x02, 0x01, 0x02), TlsCertificate.integer(BigInteger.valueOf(2))));
+        check("BIT STRING carries the unused-bits byte", Arrays.equals(bytes(0x03, 0x02, 0x05, 0xA0), TlsCertificate.bitstring(bytes(0xA0), 5)));
+        check("SEQUENCE of NULL is 30 02 05 00", Arrays.equals(bytes(0x30, 0x02, 0x05, 0x00), TlsCertificate.seq(TlsCertificate.nul())));
+    }
+
+    private static void certificateBuildsAndVerifies() throws Exception {
+        TlsCertificate.Material m = TlsCertificate.generate(Arrays.asList("192.168.1.129", "127.0.0.1"), Arrays.asList("localhost"));
+        X509Certificate c = m.certificate;
+        boolean verified;
+        try {
+            c.verify(c.getPublicKey());
+            verified = true;
+        } catch (Exception e) {
+            verified = false;
+        }
+        check("the certificate parses with the platform X.509 parser and its signature verifies", verified);
+        check("signed with SHA-256 and RSA", c.getSigAlgName().toUpperCase().contains("SHA256"));
+        check("subject and issuer are the bridge, so it is self-signed",
+                c.getSubjectX500Principal().getName().contains("CN=" + TlsCertificate.COMMON_NAME)
+                        && c.getIssuerX500Principal().equals(c.getSubjectX500Principal()));
+        check("version 3 with a positive serial", c.getVersion() == 3 && c.getSerialNumber().signum() > 0);
+        long days = (c.getNotAfter().getTime() - c.getNotBefore().getTime()) / 86400000L;
+        check("valid about ten years (" + days + " days)", days >= 3650 && days <= 3652);
+        boolean validNow;
+        try {
+            c.checkValidity(new Date());
+            validNow = true;
+        } catch (Exception e) {
+            validNow = false;
+        }
+        check("valid today", validNow);
+        check("not a CA (basic constraints critical, cA false)", c.getBasicConstraints() == -1 && c.getCriticalExtensionOIDs().contains("2.5.29.19"));
+        boolean[] ku = c.getKeyUsage();
+        check("key usage: digitalSignature and keyEncipherment", ku != null && ku[0] && ku[2]);
+        List<String> eku = c.getExtendedKeyUsage();
+        check("extended key usage: serverAuth", eku != null && eku.contains("1.3.6.1.5.5.7.3.1"));
+        Collection<List<?>> sans = c.getSubjectAlternativeNames();
+        boolean ip = false, ip2 = false, dns = false;
+        if (sans != null) {
+            for (List<?> san : sans) {
+                int type = (Integer) san.get(0);
+                if (type == 7 && "192.168.1.129".equals(san.get(1))) ip = true;
+                if (type == 7 && "127.0.0.1".equals(san.get(1))) ip2 = true;
+                if (type == 2 && "localhost".equals(san.get(1))) dns = true;
+            }
+        }
+        check("subject alternative names carry both IP addresses and localhost", ip && ip2 && dns);
+        check("the DER bytes are what the parser saw", Arrays.equals(m.certificateDer, c.getEncoded()));
+    }
+
+    private static void certificateMaterialIsReusedAndRemade() throws Exception {
+        File dir = Files.createTempDirectory("bridge-tls").toFile();
+        TlsCertificate.Material first = TlsCertificate.load(dir, Arrays.asList("192.168.1.129"));
+        TlsCertificate.Material again = TlsCertificate.load(dir, Arrays.asList("192.168.1.129"));
+        check("the first load generates and stores the material", first.generated && new File(dir, "tls-cert.der").exists() && new File(dir, "tls-key.p8").exists());
+        check("a second load with the same address reuses it byte for byte", !again.generated && Arrays.equals(first.certificateDer, again.certificateDer));
+        TlsCertificate.Material moved = TlsCertificate.load(dir, Arrays.asList("10.0.0.7"));
+        check("a new address makes a new certificate", moved.generated && !Arrays.equals(first.certificateDer, moved.certificateDer));
+        check("the addresses are recorded, sorted, with loopback added", "10.0.0.7,127.0.0.1".equals(moved.addresses));
+        for (File f : dir.listFiles()) f.delete();
+        dir.delete();
+    }
+
+    /** A real TLS handshake against the material, with a client that trusts anything, then a look at what it was shown. */
+    private static void certificateServesTls() throws Exception {
+        TlsCertificate.Material m = TlsCertificate.generate(Arrays.asList("127.0.0.1"), Arrays.asList("localhost"));
+        final SSLServerSocket server = (SSLServerSocket) m.serverSocketFactory().createServerSocket(0);
+        final byte[][] got = new byte[1][];
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    SSLSocket s = (SSLSocket) server.accept();
+                    s.startHandshake();
+                    s.getOutputStream().write("hi".getBytes());
+                    s.getOutputStream().flush();
+                    s.close();
+                } catch (Exception e) {
+                    got[0] = null;
+                }
+            }
+        });
+        t.start();
+        SSLContext ctx = SSLContext.getInstance("TLS");
+        ctx.init(null, new TrustManager[]{new X509TrustManager() {
+            public void checkClientTrusted(X509Certificate[] c, String a) {
+            }
+
+            public void checkServerTrusted(X509Certificate[] c, String a) {
+                got[0] = c.length > 0 ? safeEncoded(c[0]) : null;
+            }
+
+            public X509Certificate[] getAcceptedIssuers() {
+                return new X509Certificate[0];
+            }
+        }}, null);
+        SSLSocket client = (SSLSocket) ctx.getSocketFactory().createSocket("127.0.0.1", server.getLocalPort());
+        client.startHandshake();
+        int b = client.getInputStream().read();
+        client.close();
+        t.join(5000);
+        server.close();
+        check("a TLS client completes the handshake and receives data (" + client.getSession().getProtocol() + ")", b == 'h');
+        check("the client was shown the bridge's own certificate", got[0] != null && Arrays.equals(got[0], m.certificateDer));
+    }
+
+    private static byte[] safeEncoded(X509Certificate c) {
+        try {
+            return c.getEncoded();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static void eposDeviceIdRules() {
+        check("empty and null ids become local_printer", "local_printer".equals(EposDeviceId.sanitize("")) && "local_printer".equals(EposDeviceId.sanitize(null)) && "local_printer".equals(EposDeviceId.sanitize("  ")));
+        check("spaces and punctuation are dropped, allowed characters kept", "kitchen-1_a.b".equals(EposDeviceId.sanitize(" kitchen-1 _a.b! ")));
+        check("ids are cut at 32 characters", EposDeviceId.sanitize("abcdefghijklmnopqrstuvwxyz0123456789").length() == 32);
+        check("devid is read from the query string", "kitchen".equals(EposDeviceId.queryValue("/cgi-bin/epos/service.cgi?devid=kitchen&timeout=10000", "devid")));
+        check("parameter names are case-insensitive and values decoded", "a b".equals(EposDeviceId.queryValue("/x?DevId=a%20b", "devid")));
+        check("a missing parameter is null, an empty one is empty", EposDeviceId.queryValue("/x", "devid") == null && "".equals(EposDeviceId.queryValue("/x?devid=", "devid")));
+        check("the http link carries port, path, devid and timeout",
+                "http://192.168.1.129:8080/cgi-bin/epos/service.cgi?devid=kitchen&timeout=10000".equals(EposDeviceId.serviceUrl(false, "192.168.1.129", 8080, "kitchen")));
+        check("default ports are omitted", "https://h/cgi-bin/epos/service.cgi?devid=local_printer&timeout=10000".equals(EposDeviceId.serviceUrl(true, "h", 443, "")));
+        check("the certificate link points at /cert over https", "https://192.168.1.129:8443/cert".equals(EposDeviceId.certificateUrl("192.168.1.129", 8443)));
+    }
+
+    private static void telemetryLogWritesRows() throws Exception {
+        File dir = Files.createTempDirectory("bridge-telemetry").toFile();
+        TelemetryLog log = new TelemetryLog(dir);
+        Date now = new Date();
+        log.write(now, "61.0", "55.2", "1830", "72", "144", "3.1", "0.4", "1", "0", "31.0", "41.5", "none", "78", "Charging", "1150", "3.94", "0");
+        log.noteEvent(now.getTime(), "printed: Order #1042 printed · 1.2 KB");
+        log.noteEvent(now.getTime(), "warning: Cut removed \"GS V\"");
+        log.write(now, "62.0", "55.3", "1832", "71", "144", "0.0", "0.0", "1", "0", "31.0", "41.6", "none", "78", "Charging", "1140", "3.94", "0");
+        File f = log.fileFor(now);
+        List<String> lines = Files.readAllLines(f.toPath());
+        check("the file starts with the header and holds one line per row", lines.size() == 3 && lines.get(0).equals(TelemetryLog.HEADER));
+        check("the first row has a timestamp, the values and an empty event column",
+                lines.get(1).matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2},61\\.0,55\\.2,1830,72,144,3\\.1,0\\.4,1,0,31\\.0,41\\.5,none,78,Charging,1150,3\\.94,0,\"\""));
+        check("the events noted since the previous row land in the last column, quotes doubled",
+                lines.get(2).endsWith(",\"" + new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(now) + " printed: Order #1042 printed · 1.2 KB | "
+                        + new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(now) + " warning: Cut removed \"\"GS V\"\"\""));
+        check("files() lists it and bytesToday() counts it", log.files().size() == 1 && log.bytesToday() == f.length());
+        check("clear() deletes every telemetry file", log.clear() == 1 && log.files().isEmpty() && !f.exists());
+        dir.delete();
+    }
+
+    private static void eventLogKeepsNewestFirst() {
+        EventLog.clear();
+        final List<EventLog.Event> seen = new ArrayList<>();
+        EventLog.Listener l = new EventLog.Listener() {
+            @Override
+            public void onEvent(EventLog.Event e) {
+                seen.add(e);
+            }
+        };
+        EventLog.addListener(l);
+        EventLog.printed("first");
+        EventLog.warning("second");
+        EventLog.failed("third");
+        List<EventLog.Event> all = EventLog.snapshot();
+        check("events are kept newest first with their kind", all.size() == 3 && "third".equals(all.get(0).text) && all.get(0).kind == EventLog.Kind.FAILED && all.get(2).kind == EventLog.Kind.PRINTED);
+        check("listeners hear every event", seen.size() == 3);
+        for (int i = 0; i < 250; i++) EventLog.offline("bulk " + i);
+        check("the list is capped at 200", EventLog.count() == 200 && "bulk 249".equals(EventLog.snapshot().get(0).text));
+        EventLog.removeListener(l);
+        EventLog.clear();
     }
 
     private static final class MemoryTarget implements PrintTarget {

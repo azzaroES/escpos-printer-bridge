@@ -162,6 +162,8 @@ public final class BridgePrintService extends PrintService {
             PrintTarget target = opened.target;
 
             ParcelFileDescriptor fd = ParcelFileDescriptor.open(temp, ParcelFileDescriptor.MODE_READ_ONLY);
+            final boolean lowRes = com.usblanbridge.Throttle.isActive(this);
+            if (lowRes) Log.i("Cool-down: rendering \"" + label + "\" at " + com.usblanbridge.Throttle.LOW_DPI + " dpi.");
             try {
                 pdf = new PdfRasterizer(fd);
                 pages = pdf.pageCount();
@@ -176,7 +178,7 @@ public final class BridgePrintService extends PrintService {
                             return;
                         }
                         int[] size = new int[2];
-                        byte[] gray = pdf.render(i, paperDots, marginDots, printableDots, size);
+                        byte[] gray = pdf.render(i, paperDots, marginDots, printableDots, size, lowRes);
                         byte[] raster = RasterEncoder.encode(gray, size[0], size[1], true);
                         if (raster.length > 0) {
                             job.write(raster, 0, raster.length);

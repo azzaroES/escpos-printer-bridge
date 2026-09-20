@@ -18,6 +18,12 @@ pushes the bytes straight into the Windows print queue of the USB printer.
   Applies at once, while running; the other printers keep cutting.
 * **Printer actions tab**: every ticket as it went to the printer, line by line, what each job contained, the
   cuts removed, and what Windows reports about the printer (offline, paper out, cover open, paused, jobs stuck).
+* **Device tab**: live cards for the PC the bridge runs on. USB, Wi-Fi, Bluetooth, processor, RAM, GPU and
+  temperatures as tiles and 60-second graphs, with every printer event marked on the same timeline; a battery
+  card that flips over to show everything Windows knows about the battery; a cooling card that runs the fans at
+  maximum or caps the CPU for a set number of minutes. All of it goes to a telemetry CSV that can be cleared from the tab.
+* **ePOS device id and copy links**: the id a POS app names in the ePOS URL is set per printer, and the ePOS
+  link (with `?devid=`) and the certificate link a client visits once are each one click away.
 * Windows Firewall rule, "Start with Windows" (logon task with admin rights), tray icon, log files, print log.
 
 This is the Windows half of [escpos-printer-bridge](https://github.com/azzaroES/escpos-printer-bridge).
@@ -71,9 +77,13 @@ answers, on the mapping's LAN address:
 | `http://<LAN address>/cgi-bin/epos/service.cgi` | 80 (also 8008) |
 | `https://<LAN address>/cgi-bin/epos/service.cgi` | 443 (also 8043) |
 
-Use device id `local_printer`. The bridge parses the `<epos-print>` XML, converts it to ESC/POS and prints it, then
-returns the `<response success="true" …/>` the SDK expects. Because the conversion happens on the PC, **any generic
-ESC/POS printer works**; it does not have to be an Epson.
+The bridge answers the **device id** set for the mapping: `local_printer` by default, which is what a real Epson
+uses, or a name of your own such as `kitchen`. A request naming any other id gets `DeviceNotFound`, as a real
+printer answers. The row under the mapping list holds the id and two buttons: **Copy ePOS link** copies the full
+URL with `?devid=` for the selected printer, ready to paste into the POS app (in the SDK the same id goes into
+`createDevice`), and **Copy certificate link** copies the page described below. The bridge parses the
+`<epos-print>` XML, converts it to ESC/POS and prints it, then returns the `<response success="true" …/>` the SDK
+expects. Because the conversion happens on the PC, **any generic ESC/POS printer works**; it does not have to be an Epson.
 
 Port 80 and 443 are the defaults because the SDK builds its URL with no port at all, which is why POS apps often ask
 only for an IP address. 8008/8043 are served as well for clients that use those.
@@ -88,10 +98,13 @@ If your POS page is served over **HTTPS you must use the https endpoint**. Brows
 page to an http address (mixed content), and that is usually what a Content-Security-Policy error is really about.
 The bridge serves TLS with a self-signed certificate it generates on first use. To stop the browser warning:
 
-* **Tools → Export ePOS HTTPS certificate…**, copy the `.cer` to the client, and install it as a trusted CA
+* **Copy certificate link** copies `https://<LAN address>/cert`. Open it once on each client device and accept
+  the warning; the page then confirms that the device trusts the bridge, and offers the `.cer` file for a
+  permanent install so no browser or app on that device ever warns again. The same page is served at
+  `/cert` on the http ports, where it points at the https link.
+* Or **Tools → Export ePOS HTTPS certificate…**, copy the `.cer` to the client, and install it as a trusted CA
   (Windows: Local Machine → Trusted Root Certification Authorities; Android: Settings → Security → Encryption &
   credentials → Install a certificate → CA certificate; iOS: install the profile, then enable full trust).
-* Or open the https URL once on the client and accept the warning.
 
 Cross-origin requests are handled: the bridge answers the CORS preflight and sets
 `Access-Control-Allow-Private-Network: true`, which Chrome requires when a public https page calls a private LAN address.
@@ -133,6 +146,50 @@ What it cannot do: the bridge only controls the bytes it forwards. A cut trigger
 feed button, a DIP switch or a memory switch such as "cut on form feed", is not something software on the PC
 can prevent. If the printer still cuts with No cut on, the Printer actions tab shows the job contained no cut
 command, and the printer's own setup is where to look.
+
+## The Device tab
+
+The third tab at the bottom of the window is about the PC the bridge runs on, for the moment a till slows down,
+a laptop gets hot, or a printer drops off. When it is selected the tab area grows to most of the window. Three cards:
+
+**System.** Seven tiles, refreshed every second: **USB** (printers online out of those mapped), **Wi-Fi** (signal
+and link speed, or the wired link), **Bluetooth** (printers online out of those mapped), **Processor** (load and
+clock), **RAM**, **Video** (GPU load, memory and adapter name) and **Temperatures** (CPU, GPU, battery). Each tile
+carries a chip: **LIVE** for a reading Windows gives directly, **EST** for the closest reading available, **N/A**
+when this PC does not expose it (a desktop has no battery temperature; a GPU without a driver counter shows no
+load). Below the tiles, two graphs of the last 60 seconds with a crosshair and tooltip on hover: **Load** (CPU,
+RAM, GPU, Wi-Fi signal) and **Temperature** with a red line at the throttling point. **Every printer event is a
+marker on the same timeline**: a ticket printed (green), a cut removed by No cut or an ePOS element skipped
+(amber), a printer reported offline or not taking data (orange), a failed job (red), so a spike and the order that
+caused it line up. Two strips show when each USB and Bluetooth printer was online, and a list under the graphs
+names the latest events with their time.
+
+**Battery** (laptops; a desktop shows "no battery"). The front shows the level in large type, the state
+(charging on AC, discharging, full, the watts and volts), a graph of the level per minute over the last hour and
+bars of the current in and out, with tooltips. Tap **Details** and the card flips over to everything Windows
+reports: state, power source, current, power, voltage, temperature, time remaining, design and full-charge
+capacity, wear, cycle count, chemistry and manufacturer.
+
+**Cooling.** Windows has no fan control an application may use, so the card does the two things it can:
+**Fans to max for N minutes** sets the active power plan's cooling policy to *Active* and the processor maximum to
+100 %, which on most laptops runs the fans up at once, and **Throttle: CPU at N % for N minutes** caps the
+processor maximum instead, for a machine that is overheating. Both use `powercfg`, count down on the card, and
+restore the plan's previous values when the timer ends, when you press Stop, or when the app closes. They need the
+administrator rights the app normally runs with. Each start and stop is a printer event as well, so a throttled
+period is visible on the graphs.
+
+**Telemetry log.** Every tile, both graphs and every event go to `logs\telemetry-YYYYMMDD.csv`, one row every
+five seconds with a full timestamp and the events since the previous row, kept for 14 days. The panel at the
+bottom of the System card shows today's file and its size, opens the log folder, and **Clear telemetry logs…**
+deletes the files after a confirmation.
+
+**Fold and reorder.** Every card, and every block inside a card (the tiles, each graph, the printer strips, the
+event list, the telemetry panel, each battery graph, each cooling control), is an accordion section. Click its
+heading to fold it; the heading then carries a one-line summary (`CPU 29 % · RAM 62 % · GPU 6 %`), so the gist
+stays on screen. Drag the **≡** grip to move a card, or a block within its card, to where you want it; the page
+scrolls when the pointer nears its edge. On the main window, **Fold settings** next to the buttons tucks the
+settings, NO CUT and ePOS rows away so the printer list and the tabs get the room. What is folded and the order of
+everything is saved in the configuration and restored at the next start.
 
 ## Troubleshooting
 
@@ -258,12 +315,15 @@ Requires the .NET SDK, version 6 or newer. No Visual Studio needed.
 build.cmd
 ```
 
-produces `dist\UsbLanPrinterBridge.exe` and runs the self-test harness (`tests\UsbLanPrinterBridge.Tests`, 60 checks),
+produces `dist\UsbLanPrinterBridge.exe` and runs the self-test harness (`tests\UsbLanPrinterBridge.Tests`, 65 checks),
 which covers the ESC/POS responder, the NO CUT filter (every cut form, cut bytes inside image and QR payloads, every
 TCP split point, 256 KB of random data, the switch flipped mid-job, per printer end to end through two listeners),
-the ticket renderer, the job summariser, the printer actions log, the spooler status probe, the TCP listener, the
-manager, the ePOS converter and HTTP/HTTPS server, the config store, a real RAW job through winspool (redirected to a
-file via the XPS writer), the iphlpapi struct layout, and renders the main window to `test-output\mainform.png`.
+the ticket renderer, the job summariser, the printer actions log, the spooler status probe, the device monitor (a
+sample, the telemetry row it writes, and a printer action arriving as an event), the ePOS device id (a print with
+the right id, `DeviceNotFound` for another) and the `/cert` page and `.cer` download, the TCP listener, the manager,
+the ePOS converter and HTTP/HTTPS server, the config store, a real RAW job through winspool (redirected to a file via
+the XPS writer), the iphlpapi struct layout, and renders the main window to `test-output\mainform.png` and the Device
+tab to `test-output\mainform-device.png`.
 Running the harness as administrator additionally adds and removes a real address on the loopback adapter; without
 admin that check expects "access denied" instead.
 

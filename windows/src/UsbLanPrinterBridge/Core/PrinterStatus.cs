@@ -27,6 +27,8 @@ namespace UsbLanPrinterBridge.Core
 
         public bool IsPaused { get { return (StatusFlags & Paused) != 0; } }
         public bool IsWorkOffline { get { return (Attributes & WorkOffline) != 0; } }
+        /// <summary>The port monitor reports the printer as offline (unplugged, switched off).</summary>
+        public bool IsOffline { get { return (StatusFlags & Offline) != 0; } }
 
         /// <summary>Everything wrong, in words: "Offline, Paper out". Empty when the queue is fine.</summary>
         public List<string> Problems()

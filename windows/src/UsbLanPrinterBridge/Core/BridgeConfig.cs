@@ -21,6 +21,39 @@ namespace UsbLanPrinterBridge.Core
             EposHttpPort = 80;
             EposHttpsPort = 443;
             EposModelName = "TM-T20II";
+            EposDeviceId = DefaultEposDeviceId;
+        }
+
+        public const string DefaultEposDeviceId = "local_printer";
+
+        /// <summary>
+        /// The device id this mapping answers to in ePOS-Print requests (the "devid" in the URL, or createDevice in
+        /// the SDK). A request naming another id gets DeviceNotFound, as a real printer answers.
+        /// </summary>
+        public string EposDeviceId { get; set; }
+
+        /// <summary>Keeps only the characters a device id may contain; empty becomes the default.</summary>
+        public static string SanitizeDeviceId(string id)
+        {
+            if (id == null) return DefaultEposDeviceId;
+            var sb = new System.Text.StringBuilder();
+            foreach (char c in id.Trim())
+                if (char.IsLetterOrDigit(c) || c == '_' || c == '-' || c == '.') sb.Append(c);
+            return sb.Length == 0 ? DefaultEposDeviceId : (sb.Length > 32 ? sb.ToString(0, 32) : sb.ToString());
+        }
+
+        /// <summary>The ePOS-Print URL a client should use for this mapping, with the device id and the SDK's usual timeout.</summary>
+        public string EposUrl(bool https, string host)
+        {
+            int port = https ? EposHttpsPort : EposHttpPort;
+            bool defaultPort = https ? port == 443 : port == 80;
+            return (https ? "https://" : "http://") + host + (defaultPort ? "" : ":" + port) + "/cgi-bin/epos/service.cgi?devid=" + SanitizeDeviceId(EposDeviceId) + "&timeout=10000";
+        }
+
+        /// <summary>The page a client opens once to trust this bridge's certificate.</summary>
+        public string CertificateUrl(string host)
+        {
+            return "https://" + host + (EposHttpsPort == 443 ? "" : ":" + EposHttpsPort) + "/cert";
         }
 
         [XmlAttribute] public string Id { get; set; }
@@ -53,6 +86,14 @@ namespace UsbLanPrinterBridge.Core
         }
     }
 
+    /// <summary>The order the user dragged one group of sections into.</summary>
+    public sealed class SectionOrder
+    {
+        [XmlAttribute] public string Group { get; set; }
+        /// <summary>Section keys, comma separated.</summary>
+        [XmlAttribute] public string Keys { get; set; }
+    }
+
     [XmlRoot("UsbLanPrinterBridge")]
     public sealed class BridgeConfig
     {
@@ -64,9 +105,40 @@ namespace UsbLanPrinterBridge.Core
             AutoStartBridges = false;
             CloseToTray = true;
             NoCutFeedLines = 4;
+            CollapsedSections = new List<string>();
+            SectionOrders = new List<SectionOrder>();
         }
 
         public List<MappingConfig> Mappings { get; set; }
+
+        /// <summary>Keys of the sections the user folded up (Device tab cards and their blocks, the settings rows).</summary>
+        [XmlArrayItem("Key")] public List<string> CollapsedSections { get; set; }
+        /// <summary>The order of each group of sections, as the user dragged them.</summary>
+        public List<SectionOrder> SectionOrders { get; set; }
+
+        public bool IsSectionCollapsed(string key) { return CollapsedSections != null && CollapsedSections.Contains(key); }
+
+        public void SetSectionCollapsed(string key, bool collapsed)
+        {
+            if (CollapsedSections == null) CollapsedSections = new List<string>();
+            CollapsedSections.Remove(key);
+            if (collapsed) CollapsedSections.Add(key);
+        }
+
+        public string[] GetSectionOrder(string group)
+        {
+            if (SectionOrders == null) return null;
+            foreach (SectionOrder o in SectionOrders)
+                if (o.Group == group && !string.IsNullOrEmpty(o.Keys)) return o.Keys.Split(',');
+            return null;
+        }
+
+        public void SetSectionOrder(string group, string[] keys)
+        {
+            if (SectionOrders == null) SectionOrders = new List<SectionOrder>();
+            SectionOrders.RemoveAll(o => o.Group == group);
+            SectionOrders.Add(new SectionOrder { Group = group, Keys = string.Join(",", keys ?? new string[0]) });
+        }
 
         /// <summary>Silence on a connection (ms) that ends the current print job. 0 = only on disconnect.</summary>
         public int JobIdleTimeoutMs { get; set; }
@@ -154,6 +226,8 @@ namespace UsbLanPrinterBridge.Core
                 {
                     var cfg = (BridgeConfig)serializer.Deserialize(stream);
                     if (cfg.Mappings == null) cfg.Mappings = new List<MappingConfig>();
+                    if (cfg.CollapsedSections == null) cfg.CollapsedSections = new List<string>();
+                    if (cfg.SectionOrders == null) cfg.SectionOrders = new List<SectionOrder>();
                     foreach (MappingConfig m in cfg.Mappings)
                     {
                         if (string.IsNullOrEmpty(m.Id)) m.Id = Guid.NewGuid().ToString("N");
@@ -162,6 +236,7 @@ namespace UsbLanPrinterBridge.Core
                         if (m.EposHttpPort <= 0 || m.EposHttpPort > 65535) m.EposHttpPort = 80;
                         if (m.EposHttpsPort <= 0 || m.EposHttpsPort > 65535) m.EposHttpsPort = 443;
                         if (string.IsNullOrWhiteSpace(m.EposModelName)) m.EposModelName = "TM-T20II";
+                        m.EposDeviceId = MappingConfig.SanitizeDeviceId(m.EposDeviceId);
                     }
                     return cfg;
                 }

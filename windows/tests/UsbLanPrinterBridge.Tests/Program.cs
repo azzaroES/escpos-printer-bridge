@@ -58,6 +58,11 @@ namespace UsbLanPrinterBridge.Tests
             Run("Job summary: describes what a job told the printer", Summary_Describes);
             Run("Job summary: spots PCL/PostScript/ZPL jobs sent to a receipt printer", Summary_ForeignFormat);
             Run("Printer actions log: records, counts errors, writes the daily file", Actions_Log);
+            Run("Device: printer actions become timeline events", Device_Events);
+            Run("Device: one sample fills the tiles and writes a telemetry row; clear deletes it", Device_SampleAndTelemetry);
+            Run("ePOS: the device id in the URL must match the mapping's (DeviceNotFound otherwise)", Epos_DeviceId);
+            Run("HTTP server: /cert page and the .cer download", Http_CertPage);
+            Run("Config: ePOS device id is sanitised and builds the links", Config_DeviceId);
             Run("Printer status: XPS writer is ready; an unknown printer is reported once", Status_Probe);
 
             Run("Listener: one connection = one job", Listener_SingleJob);
@@ -847,6 +852,119 @@ namespace UsbLanPrinterBridge.Tests
             }
         }
 
+        private static void Device_Events()
+        {
+            DeviceEvent e1 = DeviceMonitor.ToEvent(new PrinterAction { Time = DateTime.Now, Level = ActionLevel.Info, Printer = "TM", Source = "10.0.0.5:1", What = "Sent 1.2 KB to the printer (idle)", Detail = "init; 3 lines" });
+            Check(e1 != null && e1.Kind == DeviceEventKind.Printed && e1.Text.StartsWith("Printed 1.2 KB") && e1.Text.Contains("TM") && e1.Text.Contains("10.0.0.5"), "a sent job is a green printed event: " + (e1 == null ? "null" : e1.Text));
+            DeviceEvent e2 = DeviceMonitor.ToEvent(new PrinterAction { Time = DateTime.Now, Level = ActionLevel.Info, Printer = "TM", Source = "x", What = "Cut removed (NO CUT is on for this printer)", Detail = "GS V 66 0 (feed and cut) was not sent to the printer; a 4-line feed was sent instead" });
+            Check(e2 != null && e2.Kind == DeviceEventKind.Warning && e2.Text.Contains("GS V 66 0"), "a removed cut is a warning event naming the command");
+            DeviceEvent e3 = DeviceMonitor.ToEvent(new PrinterAction { Time = DateTime.Now, Level = ActionLevel.Warn, Printer = "TM", Source = "watch", What = "Printer reports: Paper out", Detail = "Load a roll." });
+            Check(e3 != null && e3.Kind == DeviceEventKind.Offline, "a printer status change is an offline event");
+            DeviceEvent e4 = DeviceMonitor.ToEvent(new PrinterAction { Time = DateTime.Now, Level = ActionLevel.Error, Printer = "TM", Source = "spooler", What = "Printer stopped accepting data after 300 bytes", Detail = "The printer is offline (error 1906). More text." });
+            Check(e4 != null && e4.Kind == DeviceEventKind.Failed && e4.Text.Contains("error 1906") && !e4.Text.Contains("More text"), "an error is a failed event with the first clause of the detail");
+            Check(DeviceMonitor.ToEvent(new PrinterAction { Time = DateTime.Now, Level = ActionLevel.Info, Printer = "TM", Source = "x", What = "Answered 2 printer queries on the printer's behalf", Detail = "" }) == null, "answered queries are not events");
+            DeviceEvent e5 = DeviceMonitor.ToEvent(new PrinterAction { Time = DateTime.Now, Level = ActionLevel.Warn, Printer = "this PC", Source = "user", What = "Cooling: fans to max for 10 min", Detail = "System cooling policy set to Active." });
+            Check(e5 != null && e5.Kind == DeviceEventKind.Warning && e5.Text.StartsWith("Cooling"), "cooling actions are warning events");
+        }
+
+        private static void Device_SampleAndTelemetry()
+        {
+            ConfigStore.DataDirectory = Path.Combine(OutDir, "data");
+            using (var mon = new DeviceMonitor(() => 12345))
+            {
+                mon.ClearTelemetry();
+                PrinterActionLog.Info("TM", "10.0.0.9:2", "Sent 900 B to the printer (idle)", "init; 2 lines");
+                DeviceSnapshot s = mon.SampleOnce();
+                Console.WriteLine("      cpu " + Math.Round(s.CpuPercent) + " % (" + s.CpuQuality + "), ram " + Math.Round(s.RamPercent) + " % of " + s.RamTotalGb.ToString("0.0") + " GB, gpu " + (s.GpuPercent.HasValue ? Math.Round(s.GpuPercent.Value) + " %" : "n/a") + " " + s.GpuName + ", temps " + s.TempQuality + " " + s.TempSource + ", net " + s.NetLabel + " " + (s.WifiSignalPercent.HasValue ? s.WifiSignalPercent + " %" : "") + ", usb " + s.UsbPrintersOnline + "/" + s.UsbPrinters + ", battery " + (s.Battery.Present ? s.Battery.Percent + " % " + s.Battery.StateText : "none"));
+                Check(s.RamTotalGb > 0.5 && s.RamPercent > 0 && s.RamPercent <= 100, "RAM read");
+                Check(s.Cores > 0, "core count");
+                Check(s.Cpu != null && s.Cpu.Length == DeviceMonitor.HistorySeconds && s.Cpu[DeviceMonitor.HistorySeconds - 1].HasValue == (s.CpuQuality != ReadingQuality.NotAvailable), "history ring holds the newest sample last");
+                Check(s.Events.Count >= 1 && s.Events[0].Kind == DeviceEventKind.Printed, "the printer action arrived as an event");
+                string file = DeviceMonitor.TelemetryFileFor(DateTime.Now);
+                Check(File.Exists(file), "telemetry file written: " + file);
+                string[] lines;
+                using (var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))   // the monitor keeps it open for appending
+                using (var reader = new StreamReader(fs)) lines = reader.ReadToEnd().Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(l => l.TrimEnd('\r')).ToArray();
+                Check(lines.Length >= 2 && lines[0].StartsWith("Time,CpuPct,") && lines[1].StartsWith(DateTime.Now.ToString("yyyy-MM-dd")), "header and one timestamped row");
+                Check(lines[1].Contains("Sent 900 B") || lines[1].Contains("Printed 900 B"), "the event text rides in the row: " + lines[1]);
+                Check(lines[1].Split(',').Length >= 26, "all columns present (" + lines[1].Split(',').Length + ")");
+                int deleted = mon.ClearTelemetry();
+                Check(deleted >= 1 && !File.Exists(file), "clear deleted the file");
+                Check(mon.Snapshot().Events.Count == 0 || mon.SampleOnce().Events.Count == 0, "clear emptied the event list");
+                mon.ClearTelemetry();
+            }
+        }
+
+        private static void Epos_DeviceId()
+        {
+            var target = new MemoryPrintTarget("devid-test");
+            var server = new HttpBridgeServer(target, null, () => "kitchen");
+            server.Start(IPAddress.Loopback, 0);
+            try
+            {
+                int port = server.LocalEndPoint.Port;
+                byte[] job;
+                string wrong = HttpPost(IPAddress.Loopback, port, "/cgi-bin/epos/service.cgi?devid=bar&timeout=5000", "<epos-print xmlns=\"" + EposPrintConverter.EposNamespace + "\"><text>Hi\n</text></epos-print>", out job, target);
+                Check(wrong.Contains("success=\"false\"") && wrong.Contains("DeviceNotFound"), "another device id is refused with DeviceNotFound: " + wrong.Split('\n').Last());
+                Check(target.JobCount == 0, "nothing printed for the wrong id");
+                string right = HttpPost(IPAddress.Loopback, port, "/cgi-bin/epos/service.cgi?devid=Kitchen&timeout=5000", "<epos-print xmlns=\"" + EposPrintConverter.EposNamespace + "\"><text>Hi\n</text></epos-print>", out job, target);
+                Check(right.Contains("success=\"true\"") && target.JobCount == 1, "the mapping's id (case-insensitive) prints");
+                string none = HttpPost(IPAddress.Loopback, port, "/cgi-bin/epos/service.cgi", "<epos-print xmlns=\"" + EposPrintConverter.EposNamespace + "\"><text>Hi\n</text></epos-print>", out job, target);
+                Check(none.Contains("success=\"true\"") && target.JobCount == 2, "a request without a device id still prints");
+                Check(HttpBridgeServer.QueryValue("/x?a=1&devid=my%20printer&b", "devid") == "my printer" && HttpBridgeServer.QueryValue("/x", "devid") == null, "query parsing");
+            }
+            finally { server.Stop(); }
+        }
+
+        private static void Http_CertPage()
+        {
+            ConfigStore.DataDirectory = Path.Combine(OutDir, "data");
+            SelfSignedCertificate.GetOrCreate(new[] { IPAddress.Loopback });
+            var target = new MemoryPrintTarget("cert-test");
+            var server = new HttpBridgeServer(target, null, () => "local_printer");
+            server.Start(IPAddress.Loopback, 0);
+            try
+            {
+                int port = server.LocalEndPoint.Port;
+                string page = HttpGet(IPAddress.Loopback, port, "/cert");
+                Check(page.StartsWith("HTTP/1.1 200") && page.Contains("Trust this bridge") && page.Contains("/cert/UsbLanPrinterBridge.cer") && page.Contains("devid=local_printer"), "the http cert page points at the https link and the download");
+                byte[] der = HttpGetBytes(IPAddress.Loopback, port, "/cert/UsbLanPrinterBridge.cer", "application/x-x509-ca-cert");
+                Check(der != null && der.Length > 200, "the .cer download has a body");
+                var cert = new System.Security.Cryptography.X509Certificates.X509Certificate2(der);
+                Check(cert.Subject.Contains("USB LAN Printer Bridge"), "the download is the bridge's certificate: " + cert.Subject);
+            }
+            finally { server.Stop(); }
+        }
+
+        private static string HttpGet(IPAddress ip, int port, string path)
+        {
+            using (var c = new TcpClient()) { c.Connect(ip, port); using (NetworkStream ns = c.GetStream()) { byte[] req = Ascii("GET " + path + " HTTP/1.1\r\nHost: " + ip + ":" + port + "\r\nConnection: close\r\n\r\n"); ns.Write(req, 0, req.Length); using (var ms = new MemoryStream()) { ns.CopyTo(ms); return Encoding.UTF8.GetString(ms.ToArray()); } } }
+        }
+
+        private static byte[] HttpGetBytes(IPAddress ip, int port, string path, string expectedType)
+        {
+            using (var c = new TcpClient()) { c.Connect(ip, port); using (NetworkStream ns = c.GetStream()) { byte[] req = Ascii("GET " + path + " HTTP/1.1\r\nHost: " + ip + ":" + port + "\r\nConnection: close\r\n\r\n"); ns.Write(req, 0, req.Length); using (var ms = new MemoryStream()) { ns.CopyTo(ms); byte[] all = ms.ToArray(); string head = Encoding.ASCII.GetString(all, 0, Math.Min(all.Length, 600)); int sep = head.IndexOf("\r\n\r\n", StringComparison.Ordinal); if (sep < 0 || !head.Contains(expectedType)) return null; var body = new byte[all.Length - sep - 4]; Array.Copy(all, sep + 4, body, 0, body.Length); return body; } } }
+        }
+
+        private static void Config_DeviceId()
+        {
+            Check(MappingConfig.SanitizeDeviceId(null) == "local_printer" && MappingConfig.SanitizeDeviceId("  ") == "local_printer", "empty becomes local_printer");
+            Check(MappingConfig.SanitizeDeviceId("kitchen printer #2!") == "kitchenprinter2", "unsafe characters dropped");
+            Check(MappingConfig.SanitizeDeviceId("bar_1.a-b") == "bar_1.a-b", "letters, digits, _ - . kept");
+            var m = new MappingConfig { BindAddress = "192.168.1.200", EposDeviceId = "kitchen" };
+            Check(m.EposUrl(true, "192.168.1.200") == "https://192.168.1.200/cgi-bin/epos/service.cgi?devid=kitchen&timeout=10000", "https link: " + m.EposUrl(true, "192.168.1.200"));
+            Check(m.EposUrl(false, "192.168.1.200") == "http://192.168.1.200/cgi-bin/epos/service.cgi?devid=kitchen&timeout=10000", "http link");
+            m.EposHttpsPort = 8043;
+            Check(m.CertificateUrl("192.168.1.200") == "https://192.168.1.200:8043/cert" && m.EposUrl(true, "h").Contains(":8043/"), "non-default port appears in the links");
+            string path = Path.Combine(OutDir, "devid.xml");
+            var cfg = new BridgeConfig();
+            cfg.Mappings.Add(new MappingConfig { PrinterName = "P", BindAddress = "10.0.0.1", EposDeviceId = "bar" });
+            cfg.Mappings.Add(new MappingConfig { PrinterName = "Q", BindAddress = "10.0.0.2", EposDeviceId = "" });
+            ConfigStore.Save(cfg, path);
+            BridgeConfig back = ConfigStore.Load(path);
+            Check(back.Mappings[0].EposDeviceId == "bar" && back.Mappings[1].EposDeviceId == "local_printer", "device ids round-trip and empty is repaired on load");
+        }
+
         private static void Status_Probe()
         {
             PrinterQueueStatus unknown = PrinterStatusProbe.Query("No Such Printer 12345");
@@ -1571,6 +1689,9 @@ namespace UsbLanPrinterBridge.Tests
             ConfigStore.Save(cfg);
 
             Exception failure = null;
+            int loadOpen = 0, loadFolded = 0, sysOpen = 0, sysFolded = 0;
+            string[] cardsBefore = null, cardsAfter = null, blocksAfter = null, keys = null;
+            bool settingsFolded = false;
             var thread = new Thread(() =>
             {
                 try
@@ -1579,20 +1700,63 @@ namespace UsbLanPrinterBridge.Tests
                     var form = new MainForm(new StartupOptions { NoElevate = true });
                     form.Load += (s, e) =>
                     {
+                        int phase = 0;
                         var t = new System.Windows.Forms.Timer { Interval = 2500 };
                         t.Tick += (s2, e2) =>
                         {
-                            t.Stop();
                             try
                             {
+                                if (phase == 0)
+                                {
+                                    using (var bmp = new Bitmap(form.Width, form.Height))
+                                    {
+                                        form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
+                                        bmp.Save(Path.Combine(OutDir, "mainform.png"), ImageFormat.Png);
+                                    }
+                                    phase = 1;
+                                    form.SelectDeviceTab();   // a second capture with the Device tab showing, after a few samples
+                                    t.Interval = 3500;
+                                    return;
+                                }
+                                if (phase == 1)
+                                {
+                                    using (var bmp = new Bitmap(form.Width, form.Height))
+                                    {
+                                        form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
+                                        bmp.Save(Path.Combine(OutDir, "mainform-device.png"), ImageFormat.Png);
+                                    }
+                                    // fold a block and a whole card's worth of rows, drag a card and a block to new places
+                                    DeviceTab tab = form.DeviceTabControl;
+                                    keys = tab.SectionKeys;
+                                    // The window is on the real desktop while this runs; if someone clicked a heading, unfold it again first.
+                                    foreach (string k in keys) if (tab.IsSectionCollapsed(k)) { Console.WriteLine("      (section " + k + " was folded before the test touched it)"); tab.ToggleSection(k); }
+                                    if (form.SettingsFolded) form.ToggleSettingsFold();
+                                    loadOpen = tab.SectionHeight("sys.load");
+                                    sysOpen = tab.SectionHeight("sys");
+                                    tab.ToggleSection("sys.load");
+                                    tab.ToggleSection("sys.temps");
+                                    loadFolded = tab.SectionHeight("sys.load");
+                                    sysFolded = tab.SectionHeight("sys");
+                                    cardsBefore = tab.SectionOrder("device");
+                                    tab.MoveSection("device", "cooling", 0);
+                                    tab.MoveSection("sys", "sys.events", 0);
+                                    cardsAfter = tab.SectionOrder("device");
+                                    blocksAfter = tab.SectionOrder("sys");
+                                    form.ToggleSettingsFold();
+                                    settingsFolded = form.SettingsFolded;
+                                    phase = 2;
+                                    t.Interval = 1500;
+                                    return;
+                                }
+                                t.Stop();
                                 using (var bmp = new Bitmap(form.Width, form.Height))
                                 {
                                     form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
-                                    bmp.Save(Path.Combine(OutDir, "mainform.png"), ImageFormat.Png);
+                                    bmp.Save(Path.Combine(OutDir, "mainform-device-folded.png"), ImageFormat.Png);
                                 }
+                                form.Close();
                             }
-                            catch (Exception ex) { failure = ex; }
-                            finally { form.Close(); }
+                            catch (Exception ex) { failure = ex; t.Stop(); form.Close(); }
                         };
                         t.Start();
                     };
@@ -1608,6 +1772,25 @@ namespace UsbLanPrinterBridge.Tests
             if (failure != null) throw failure;
             string png = Path.Combine(OutDir, "mainform.png");
             Check(File.Exists(png) && new FileInfo(png).Length > 5000, "screenshot written: " + png);
+            string device = Path.Combine(OutDir, "mainform-device.png");
+            Check(File.Exists(device) && new FileInfo(device).Length > 5000, "Device tab screenshot written: " + device);
+
+            // accordion sections: fold, reorder, remember
+            Check(keys != null && keys.Contains("sys") && keys.Contains("battery") && keys.Contains("cooling") && keys.Contains("sys.tiles") && keys.Contains("sys.load")
+                && keys.Contains("sys.temps") && keys.Contains("sys.strips") && keys.Contains("sys.events") && keys.Contains("sys.telemetry")
+                && keys.Contains("bat.level") && keys.Contains("bat.current") && keys.Contains("cool.fans") && keys.Contains("cool.cap"),
+                "every card and every block inside one is a section: " + (keys == null ? "none" : string.Join(", ", keys)));
+            Check(loadOpen > 150 && loadFolded < 40, "folding a block leaves only its heading (" + loadOpen + " px to " + loadFolded + " px)");
+            Check(sysFolded < sysOpen - 250, "the card around it shrinks with it (" + sysOpen + " px to " + sysFolded + " px)");
+            Check(cardsBefore != null && cardsBefore[0] == "sys" && cardsAfter != null && cardsAfter[0] == "cooling" && cardsAfter.Length == 3, "a card can be moved to the top: " + string.Join(", ", cardsAfter ?? new string[0]));
+            Check(blocksAfter != null && blocksAfter[0] == "sys.events" && blocksAfter.Length == 6, "a block can be moved inside its card: " + string.Join(", ", blocksAfter ?? new string[0]));
+            Check(settingsFolded, "the settings rows of the main window fold away");
+            string folded = Path.Combine(OutDir, "mainform-device-folded.png");
+            Check(File.Exists(folded) && new FileInfo(folded).Length > 5000, "folded screenshot written: " + folded);
+            BridgeConfig saved = ConfigStore.Load();
+            Check(saved.IsSectionCollapsed("sys.load") && saved.IsSectionCollapsed("sys.temps") && saved.IsSectionCollapsed("main.settings") && !saved.IsSectionCollapsed("sys.tiles"), "what is folded is saved in the configuration");
+            string[] savedCards = saved.GetSectionOrder("device"), savedBlocks = saved.GetSectionOrder("sys");
+            Check(savedCards != null && savedCards[0] == "cooling" && savedBlocks != null && savedBlocks[0] == "sys.events", "the dragged order is saved in the configuration");
             ConfigStore.DataDirectory = Path.Combine(OutDir, "data");
         }
     }

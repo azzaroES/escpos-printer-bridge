@@ -69,6 +69,14 @@
                 android:resource="@xml/print_service" />
         </service>
 
+        <!-- Lets "Share log file" hand a telemetry or log file to another app. Read-only, not exported;
+             the receiving app gets a one-off grant with the share intent. -->
+        <provider
+            android:name=".FilesProvider"
+            android:authorities="com.usblanbridge.files"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
         <receiver
             android:name=".BootReceiver"
             android:exported="true"
