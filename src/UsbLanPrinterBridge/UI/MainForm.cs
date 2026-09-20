@@ -22,6 +22,9 @@ namespace UsbLanPrinterBridge.UI
         private readonly StartupOptions _options;
         private readonly BridgeManager _manager = new BridgeManager();
         private BridgeConfig _config = new BridgeConfig();
+        private LinkLabel _lnkFold;
+        private Control[] _foldableRows = new Control[0];
+        private bool _settingsFolded;
         private List<PrinterInfo> _printers = new List<PrinterInfo>();
         private List<AdapterInfo> _adapters = new List<AdapterInfo>();
         private readonly HashSet<string> _wanted = new HashSet<string>(StringComparer.Ordinal);
@@ -59,6 +62,18 @@ namespace UsbLanPrinterBridge.UI
         private bool _watchingPrinters;
         private const int MaxActionRows = 2000;
         private static readonly Color NoCutBack = Color.FromArgb(255, 226, 226);
+
+        // Device tab, cooling, and the ePOS device id row
+        private TableLayoutPanel _layout;
+        private TabPage _tabDevice;
+        private DeviceTab _deviceTab;
+        private DeviceMonitor _deviceMonitor;
+        private CoolingControl _cooling;
+        private TextBox _txtDevId;
+        private Label _lblEposRow;
+        private Label _lblCopyNote;
+        private Timer _copyNoteTimer;
+        private bool _syncingDevId;
 
         // controls
         private MenuStrip _menu;
@@ -103,8 +118,8 @@ namespace UsbLanPrinterBridge.UI
             Font = SystemFonts.MessageBoxFont;
             AutoScaleMode = AutoScaleMode.Font;
             StartPosition = FormStartPosition.CenterScreen;
-            MinimumSize = new Size(820, 560);
-            ClientSize = new Size(960, 640);
+            MinimumSize = new Size(900, 600);
+            ClientSize = new Size(1120, 800);
 
             BuildMenu();
 
@@ -130,6 +145,11 @@ namespace UsbLanPrinterBridge.UI
             _btnStopSel = MakeButton("Stop selected", (s, e) => StopSelected());
             _btnTest = MakeButton("Test print…", (s, e) => ShowTestMenu());
             buttons.Controls.AddRange(new Control[] { _btnAdd, _btnRemove, Spacer(), _btnStartAll, _btnStopAll, _btnStartSel, _btnStopSel, Spacer(), _btnTest });
+            // The settings, NO CUT and ePOS rows fold away behind this heading, like the sections of the Device tab.
+            _lnkFold = new LinkLabel { Text = "▾ Fold settings", AutoSize = true, Margin = new Padding(14, 9, 0, 0), LinkBehavior = LinkBehavior.HoverUnderline, LinkColor = SystemColors.GrayText, ActiveLinkColor = SystemColors.ControlText };
+            _lnkFold.LinkClicked += (s, e) => ToggleSettingsFold();
+            buttons.Controls.Add(_lnkFold);
+            new ToolTip().SetToolTip(_lnkFold, "Hide or show the settings, NO CUT and ePOS rows. Remembered between runs.");
 
             var settings = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Padding = new Padding(0, 2, 0, 2) };
             settings.Controls.Add(new Label { Text = "Job idle timeout (ms):", AutoSize = true, Margin = new Padding(3, 8, 0, 0) });
@@ -178,17 +198,40 @@ namespace UsbLanPrinterBridge.UI
                 HideSelection = false
             };
 
+            // ePOS row: the device id of the selected mapping and the two links a client needs.
+            var epos = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true, Padding = new Padding(0, 0, 0, 2) };
+            _lblEposRow = new Label { Text = "ePOS for the selected row:", AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(3, 8, 6, 0) };
+            _txtDevId = new TextBox { Width = 130, Margin = new Padding(3, 4, 3, 0), Text = MappingConfig.DefaultEposDeviceId };
+            _txtDevId.Leave += (s, e) => CommitDeviceId();
+            _txtDevId.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; CommitDeviceId(); } };
+            epos.Controls.Add(_lblEposRow);
+            epos.Controls.Add(new Label { Text = "device id", AutoSize = true, Margin = new Padding(0, 8, 0, 0) });
+            epos.Controls.Add(_txtDevId);
+            epos.Controls.Add(MakeButton("Copy ePOS link", (s, e) => CopyEposLink()));
+            epos.Controls.Add(MakeButton("Copy certificate link", (s, e) => CopyCertificateLink()));
+            _lblCopyNote = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(6, 8, 0, 0), Text = "The bridge answers this id and replies DeviceNotFound to any other, as a real printer does." };
+            epos.Controls.Add(_lblCopyNote);
+            new ToolTip().SetToolTip(_txtDevId, "The name a POS app puts in the ePOS URL (?devid=) or in createDevice. Default local_printer; or name it after the printer, e.g. kitchen. Letters, digits, _ - . only.");
+            _copyNoteTimer = new Timer { Interval = 9000 };
+            _copyNoteTimer.Tick += (s, e) => { _copyNoteTimer.Stop(); _lblCopyNote.ForeColor = SystemColors.GrayText; _lblCopyNote.Text = "The bridge answers this id and replies DeviceNotFound to any other, as a real printer does."; };
+
             _tabs = new TabControl { Dock = DockStyle.Fill };
             _tabLog = new TabPage("Log") { Padding = new Padding(0) };
             _tabLog.Controls.Add(_log);
             _tabActions = new TabPage("Printer actions") { Padding = new Padding(0) };
             _tabActions.Controls.Add(BuildActionsTab());
+            _tabDevice = new TabPage("Device") { Padding = new Padding(0) };
+            _deviceTab = new DeviceTab();
+            _tabDevice.Controls.Add(_deviceTab);
             _tabs.TabPages.Add(_tabLog);
             _tabs.TabPages.Add(_tabActions);
+            _tabs.TabPages.Add(_tabDevice);
+            _tabs.SelectedIndexChanged += (s, e) => AdjustLayoutForTab();
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 6, Padding = new Padding(8, 4, 8, 4) };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 7, Padding = new Padding(8, 4, 8, 4) };
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 58));
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -198,7 +241,10 @@ namespace UsbLanPrinterBridge.UI
             layout.Controls.Add(buttons, 0, 2);
             layout.Controls.Add(settings, 0, 3);
             layout.Controls.Add(emergency, 0, 4);
-            layout.Controls.Add(_tabs, 0, 5);
+            layout.Controls.Add(epos, 0, 5);
+            layout.Controls.Add(_tabs, 0, 6);
+            _layout = layout;
+            _foldableRows = new Control[] { settings, emergency, epos };
 
             _status = new StatusStrip { SizingGrip = true };
             _lblStatus = new ToolStripStatusLabel("Ready") { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
@@ -319,7 +365,7 @@ namespace UsbLanPrinterBridge.UI
             _grid.CurrentCellDirtyStateChanged += (s, e) => { if (_grid.IsCurrentCellDirty) _grid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
             _grid.CellValueChanged += (s, e) => { if (!_loadingGrid && e.RowIndex >= 0) SyncRowToMapping(_grid.Rows[e.RowIndex], e.ColumnIndex); };
             _grid.CellValidating += OnCellValidating;
-            _grid.SelectionChanged += (s, e) => UpdateButtons();
+            _grid.SelectionChanged += (s, e) => { UpdateButtons(); SyncDeviceIdField(); };
             _grid.KeyDown += (s, e) => { if (e.KeyCode == Keys.Delete && !_grid.IsCurrentCellInEditMode) { e.Handled = true; RemoveSelected(); } };
             _grid.CellBeginEdit += (s, e) =>
             {
@@ -407,6 +453,14 @@ namespace UsbLanPrinterBridge.UI
             _configLoaded = true;
             ReloadActions();
 
+            // The Device tab: sampling starts with the window and stops with it; the cooling plan is restored on exit.
+            _deviceMonitor = new DeviceMonitor(() => _manager.Listeners.Sum(l => l.BytesReceived));
+            _cooling = new CoolingControl { IsElevated = _manager.IsElevated };
+            _deviceTab.Attach(_deviceMonitor, _cooling);
+            _deviceTab.AttachStore(new ConfigSectionStore(this));
+            ApplySettingsFold(_config.IsSectionCollapsed(SettingsSectionKey), false);
+            _deviceMonitor.Start();
+
             Logger.Info("Configuration: " + ConfigStore.ConfigPath);
             if (!_manager.IsElevated)
                 Logger.Warn("Not running as administrator. Bridges can use this PC's existing addresses (or 0.0.0.0) but cannot add virtual addresses or firewall rules.");
@@ -440,6 +494,8 @@ namespace UsbLanPrinterBridge.UI
         private void ShutdownEverything()
         {
             _timer.Stop();
+            if (_deviceMonitor != null) { try { _deviceMonitor.Stop(); } catch { } }
+            if (_cooling != null) { try { _cooling.Dispose(); } catch { } }
             Logger.EntryAdded -= OnLogEntry;
             PrinterActionLog.ActionAdded -= OnPrinterAction;
             _manager.ListenerChanged -= OnListenerChanged;
@@ -551,6 +607,7 @@ namespace UsbLanPrinterBridge.UI
             }
             UpdateButtons();
             RebuildTrayNoCutMenu();
+            SyncDeviceIdField();
         }
 
         private void FillRow(DataGridViewRow row, MappingConfig m)
@@ -957,6 +1014,137 @@ namespace UsbLanPrinterBridge.UI
                 catch { }
                 finally { _watchingPrinters = false; }
             });
+        }
+
+        // =====================================================================================  ePOS device id and links
+
+        /// <summary>Shows the Device tab (used by the self-test to capture it).</summary>
+        public void SelectDeviceTab()
+        {
+            if (_tabs != null && _tabDevice != null) _tabs.SelectedTab = _tabDevice;
+        }
+
+        /// <summary>The Device tab itself, for the self-test.</summary>
+        public DeviceTab DeviceTabControl { get { return _deviceTab; } }
+
+        // ---- folded sections: which are folded and their order live in the configuration
+
+        private const string SettingsSectionKey = "main.settings";
+
+        private sealed class ConfigSectionStore : ISectionStore
+        {
+            private readonly MainForm _form;
+            public ConfigSectionStore(MainForm form) { _form = form; }
+            public bool IsCollapsed(string key) { return _form._config.IsSectionCollapsed(key); }
+            public void SetCollapsed(string key, bool collapsed) { _form._config.SetSectionCollapsed(key, collapsed); if (_form._configLoaded) _form.SaveConfig(false); }
+            public string[] GetOrder(string group) { return _form._config.GetSectionOrder(group); }
+            public void SetOrder(string group, string[] keys) { _form._config.SetSectionOrder(group, keys); if (_form._configLoaded) _form.SaveConfig(false); }
+        }
+
+        /// <summary>Folds the settings, NO CUT and ePOS rows away so the printer list and the tabs get the room.</summary>
+        public void ToggleSettingsFold()
+        {
+            ApplySettingsFold(!_settingsFolded, true);
+        }
+
+        public bool SettingsFolded { get { return _settingsFolded; } }
+
+        private void ApplySettingsFold(bool folded, bool save)
+        {
+            _settingsFolded = folded;
+            if (_layout != null)
+            {
+                _layout.SuspendLayout();
+                foreach (Control c in _foldableRows) c.Visible = !folded;
+                _layout.ResumeLayout(true);
+            }
+            if (_lnkFold != null) _lnkFold.Text = folded ? "▸ Settings, NO CUT and ePOS links (folded)" : "▾ Fold settings";
+            if (save && _configLoaded)
+            {
+                _config.SetSectionCollapsed(SettingsSectionKey, folded);
+                SaveConfig(false);
+            }
+        }
+
+        /// <summary>The Device tab wants room; the printer grid gives some up while it is showing.</summary>
+        private void AdjustLayoutForTab()
+        {
+            if (_layout == null || _layout.RowStyles.Count < 7) return;
+            bool device = _tabs.SelectedTab == _tabDevice;
+            _layout.SuspendLayout();
+            _layout.RowStyles[1].SizeType = SizeType.Percent;
+            _layout.RowStyles[1].Height = device ? 24 : 58;
+            _layout.RowStyles[6].SizeType = SizeType.Percent;
+            _layout.RowStyles[6].Height = device ? 76 : 42;
+            _layout.ResumeLayout(true);
+            if (device && _deviceTab != null) BeginInvoke(new Action(_deviceTab.ScrollToTop));
+        }
+
+        private void SyncDeviceIdField()
+        {
+            if (_txtDevId == null) return;
+            MappingConfig m = MappingOf(SelectedRows().FirstOrDefault());
+            _syncingDevId = true;
+            try
+            {
+                _txtDevId.Enabled = m != null;
+                _txtDevId.Text = m == null ? MappingConfig.DefaultEposDeviceId : MappingConfig.SanitizeDeviceId(m.EposDeviceId);
+                _lblEposRow.Text = m == null ? "ePOS (select a row):" : "ePOS for " + (string.IsNullOrEmpty(m.PrinterName) ? "the selected row" : Truncate(m.PrinterName, 28)) + ":";
+            }
+            finally { _syncingDevId = false; }
+        }
+
+        private void CommitDeviceId()
+        {
+            if (_syncingDevId) return;
+            MappingConfig m = MappingOf(SelectedRows().FirstOrDefault());
+            if (m == null) return;
+            string clean = MappingConfig.SanitizeDeviceId(_txtDevId.Text);
+            if (_txtDevId.Text != clean) _txtDevId.Text = clean;
+            if (clean == MappingConfig.SanitizeDeviceId(m.EposDeviceId)) return;
+            m.EposDeviceId = clean;
+            Logger.Info("ePOS device id for \"" + m.PrinterName + "\" is now \"" + clean + "\". Clients must use it in the URL (?devid=) or in createDevice; it applies to the next request.");
+            SaveConfig(false);
+        }
+
+        /// <summary>The host part for links: the mapping's address, or this PC's first address when it listens on all.</summary>
+        private static string LinkHost(MappingConfig m)
+        {
+            IPAddress ip;
+            if (BridgeManager.TryParseBindAddress(m.BindAddress, out ip) && !ip.Equals(IPAddress.Any)) return ip.ToString();
+            IPAddress[] all = NetworkHelper.GetHostIPv4Addresses();
+            IPAddress first = all.FirstOrDefault(a => !IPAddress.IsLoopback(a)) ?? all.FirstOrDefault();
+            return first == null ? "127.0.0.1" : first.ToString();
+        }
+
+        private void CopyEposLink()
+        {
+            MappingConfig m = MappingOf(SelectedRows().FirstOrDefault());
+            if (m == null) { MessageBox.Show(this, "Select a mapping row first.", Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            CommitDeviceId();
+            string host = LinkHost(m);
+            string https = m.EposUrl(true, host), http = m.EposUrl(false, host);
+            try { Clipboard.SetText(https); } catch { }
+            ShowCopyNote("Copied " + https + "   (plain http: " + http + ").  Paste it into the POS app; in the SDK the same id goes into createDevice.");
+            Logger.Info("Copied the ePOS link for \"" + m.PrinterName + "\": " + https);
+        }
+
+        private void CopyCertificateLink()
+        {
+            MappingConfig m = MappingOf(SelectedRows().FirstOrDefault());
+            if (m == null) { MessageBox.Show(this, "Select a mapping row first.", Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            string url = m.CertificateUrl(LinkHost(m));
+            try { Clipboard.SetText(url); } catch { }
+            ShowCopyNote("Copied " + url + ".  Open it once on each phone, tablet or PC that prints from an https page and accept the warning; that device then trusts this bridge.");
+            Logger.Info("Copied the certificate link for \"" + m.PrinterName + "\": " + url);
+        }
+
+        private void ShowCopyNote(string text)
+        {
+            _lblCopyNote.ForeColor = Color.FromArgb(10, 90, 10);
+            _lblCopyNote.Text = text;
+            _copyNoteTimer.Stop();
+            _copyNoteTimer.Start();
         }
 
         // =====================================================================================  NO CUT (per printer)
@@ -1606,7 +1794,7 @@ namespace UsbLanPrinterBridge.UI
                 sb.AppendLine("   https://" + ip + "/cgi-bin/epos/service.cgi");
             }
             sb.AppendLine();
-            sb.AppendLine("In the ePOS SDK, connect with device id \"local_printer\".");
+            sb.AppendLine("In the ePOS SDK, connect with device id \"" + MappingConfig.SanitizeDeviceId(m.EposDeviceId) + "\" (set on the ePOS row under the settings; \"Copy ePOS link\" gives the full URL).");
             sb.AppendLine("Use the HTTPS endpoint when your POS page is served over HTTPS (browsers block http from an https page).");
             sb.AppendLine("For HTTPS, install the bridge certificate on the client first (Tools -> Export ePOS HTTPS certificate),");
             sb.AppendLine("or open the https URL once in the client's browser and accept the security warning.");
@@ -1788,6 +1976,9 @@ namespace UsbLanPrinterBridge.UI
                 PrinterActionLog.ActionAdded -= OnPrinterAction;
                 _manager.ListenerChanged -= OnListenerChanged;
                 if (_timer != null) _timer.Dispose();
+                if (_copyNoteTimer != null) _copyNoteTimer.Dispose();
+                if (_deviceMonitor != null) _deviceMonitor.Dispose();
+                if (_cooling != null) _cooling.Dispose();
                 if (_tray != null) _tray.Dispose();
             }
             base.Dispose(disposing);

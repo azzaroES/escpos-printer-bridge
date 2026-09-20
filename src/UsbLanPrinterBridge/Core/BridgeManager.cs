@@ -262,7 +262,7 @@ namespace UsbLanPrinterBridge.Core
             string scheme = cert == null ? "http" : "https";
             try
             {
-                var server = new HttpBridgeServer(target, cert);
+                var server = new HttpBridgeServer(target, cert, () => mapping.EposDeviceId);
                 server.Log += msg => Logger.Info("[ePOS " + scheme + " " + ip + ":" + port + "] " + msg);
                 server.Start(ip, port);
                 servers.Add(server);

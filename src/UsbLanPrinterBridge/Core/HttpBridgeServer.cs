@@ -24,6 +24,7 @@ namespace UsbLanPrinterBridge.Core
     {
         private readonly IPrintTarget _target;
         private readonly X509Certificate2 _certificate; // null => plain HTTP
+        private readonly Func<string> _deviceId;        // null => answer any device id
         private readonly object _gate = new object();
         private readonly HashSet<Socket> _sockets = new HashSet<Socket>();
         private TcpListener _listener;
@@ -32,11 +33,31 @@ namespace UsbLanPrinterBridge.Core
         private long _requests;
         private long _jobs;
 
-        public HttpBridgeServer(IPrintTarget target, X509Certificate2 certificate)
+        public HttpBridgeServer(IPrintTarget target, X509Certificate2 certificate) : this(target, certificate, null) { }
+
+        /// <param name="deviceId">Asked per request for the device id this endpoint answers to; null accepts any.</param>
+        public HttpBridgeServer(IPrintTarget target, X509Certificate2 certificate, Func<string> deviceId)
         {
             if (target == null) throw new ArgumentNullException("target");
             _target = target;
             _certificate = certificate;
+            _deviceId = deviceId;
+        }
+
+        /// <summary>The "devid" the client put in the URL, or null.</summary>
+        public static string QueryValue(string path, string name)
+        {
+            if (string.IsNullOrEmpty(path)) return null;
+            int q = path.IndexOf('?');
+            if (q < 0) return null;
+            foreach (string pair in path.Substring(q + 1).Split('&'))
+            {
+                int eq = pair.IndexOf('=');
+                string k = eq < 0 ? pair : pair.Substring(0, eq);
+                if (!string.Equals(Uri.UnescapeDataString(k), name, StringComparison.OrdinalIgnoreCase)) continue;
+                return eq < 0 ? "" : Uri.UnescapeDataString(pair.Substring(eq + 1).Replace('+', ' '));
+            }
+            return null;
         }
 
         public bool IsSecure { get { return _certificate != null; } }
@@ -210,6 +231,24 @@ namespace UsbLanPrinterBridge.Core
 
             if (req.Method == "GET")
             {
+                string pathOnly = req.Path;
+                int q = pathOnly.IndexOf('?');
+                if (q >= 0) pathOnly = pathOnly.Substring(0, q);
+                pathOnly = pathOnly.TrimEnd('/');
+                if (pathOnly.Equals("/cert", StringComparison.OrdinalIgnoreCase))
+                {
+                    await WriteCertPage(stream, req, origin).ConfigureAwait(false);
+                    return;
+                }
+                if (pathOnly.EndsWith(".cer", StringComparison.OrdinalIgnoreCase) && pathOnly.StartsWith("/cert", StringComparison.OrdinalIgnoreCase))
+                {
+                    byte[] der = PublicCertificate();
+                    if (der == null)
+                        await WriteResponse(stream, 404, "Not Found", "text/plain; charset=utf-8", Encoding.UTF8.GetBytes("No certificate has been generated yet; start a mapping with ePOS web ticked."), origin, null).ConfigureAwait(false);
+                    else
+                        await WriteResponse(stream, 200, "OK", "application/x-x509-ca-cert", der, origin, new List<string> { "Content-Disposition: attachment; filename=\"UsbLanPrinterBridge.cer\"", "Access-Control-Allow-Origin: *" }).ConfigureAwait(false);
+                    return;
+                }
                 await WriteStatusPage(stream, origin).ConfigureAwait(false);
                 return;
             }
@@ -221,6 +260,19 @@ namespace UsbLanPrinterBridge.Core
         {
             string bodyXml = req.BodyText();
             string printJobId = ExtractPrintJobId(bodyXml);
+
+            // The device id in the URL must be the one this printer answers to, as with a real ePOS printer.
+            string wanted = _deviceId == null ? null : MappingConfig.SanitizeDeviceId(_deviceId());
+            string asked = QueryValue(req.Path, "devid");
+            if (!string.IsNullOrEmpty(wanted) && !string.IsNullOrEmpty(asked) && !string.Equals(asked, wanted, StringComparison.OrdinalIgnoreCase))
+            {
+                Emit("ePOS request from " + remote + " asked for device id \"" + asked + "\"; this printer answers \"" + wanted + "\". Replied DeviceNotFound.");
+                PrinterActionLog.Warn(_target.Name, "ePOS " + remote, "ePOS request refused: device id \"" + asked + "\"",
+                    "This printer answers the id \"" + wanted + "\". Set that id in the POS app (the devid in the URL, or createDevice in the SDK), or change the id on the mapping. Replied DeviceNotFound, as a real printer would.");
+                byte[] refused = Encoding.UTF8.GetBytes(BuildResponse(false, "DeviceNotFound", 0, printJobId));
+                await WriteResponse(stream, 200, "OK", "text/xml; charset=utf-8", refused, origin, null).ConfigureAwait(false);
+                return;
+            }
 
             string responseXml;
             try
@@ -283,6 +335,70 @@ namespace UsbLanPrinterBridge.Core
             if (string.Equals(req.Header("Access-Control-Request-Private-Network"), "true", StringComparison.OrdinalIgnoreCase))
                 extra.Add("Access-Control-Allow-Private-Network: true");
             await WriteResponse(stream, 204, "No Content", null, new byte[0], origin, extra).ConfigureAwait(false);
+        }
+
+        /// <summary>The public certificate as DER, for the .cer download on both the HTTPS and the HTTP endpoint.</summary>
+        private byte[] PublicCertificate()
+        {
+            try
+            {
+                if (_certificate != null) return _certificate.Export(X509ContentType.Cert);
+                if (File.Exists(SelfSignedCertificate.CerPath)) return File.ReadAllBytes(SelfSignedCertificate.CerPath);
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>
+        /// The page a client device opens once. Over HTTPS, reaching it at all means the warning was accepted and
+        /// the browser now trusts this address, so the page says so; over HTTP it points at the https link.
+        /// </summary>
+        private async Task WriteCertPage(Stream stream, HttpRequest req, string origin)
+        {
+            string host = req.Header("Host");
+            if (string.IsNullOrEmpty(host)) host = LocalEndPoint == null ? "127.0.0.1" : LocalEndPoint.Address.ToString();
+            string hostOnly = host;
+            int colon = hostOnly.LastIndexOf(':');
+            if (colon > 0) hostOnly = hostOnly.Substring(0, colon);
+            string devid = _deviceId == null ? MappingConfig.DefaultEposDeviceId : MappingConfig.SanitizeDeviceId(_deviceId());
+            string endpoint = Scheme + "://" + host + "/cgi-bin/epos/service.cgi?devid=" + devid + "&timeout=10000";
+            string cerLink = Scheme + "://" + host + "/cert/UsbLanPrinterBridge.cer";
+            string validity = "";
+            string sans = "";
+            try
+            {
+                if (_certificate != null)
+                {
+                    validity = " Valid until " + _certificate.NotAfter.ToString("yyyy-MM-dd") + ".";
+                    foreach (X509Extension ext in _certificate.Extensions)
+                        if (ext.Oid != null && ext.Oid.Value == "2.5.29.17") sans = " It covers " + ext.Format(false).Replace("IP Address=", "").Replace("DNS Name=", "") + ".";
+                }
+            }
+            catch { }
+
+            string body;
+            if (IsSecure)
+            {
+                body = "<div class=ok><svg width=40 height=40 viewBox='0 0 40 40'><circle cx=20 cy=20 r=19 fill='#dcf3dc'/><path d='M12 21 L17.5 26.5 L28 15' fill=none stroke='#0a5a0a' stroke-width=3.5 stroke-linecap=round stroke-linejoin=round/></svg>"
+                     + "<h1>This device now trusts the bridge</h1></div>"
+                     + "<p>Because you accepted the warning, apps and web pages on this device can print through<br><b>" + WebEncode(endpoint) + "</b><br>with device id <b>" + WebEncode(devid) + "</b>. Nothing else to do here. The trust is remembered by this browser for this address.</p>";
+            }
+            else
+            {
+                string httpsUrl = "https://" + hostOnly + "/cert";
+                body = "<h1>Trust this bridge on this device</h1>"
+                     + "<p>You opened the plain http address. To make this device trust the bridge's certificate, open <a href='" + WebEncode(httpsUrl) + "'><b>" + WebEncode(httpsUrl) + "</b></a> and accept the warning once. Printing over plain http works without that: <b>" + WebEncode(endpoint) + "</b>, device id <b>" + WebEncode(devid) + "</b>.</p>";
+            }
+            string html = "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>USB LAN Printer Bridge — certificate</title>"
+                        + "<body style='font-family:Segoe UI,system-ui,sans-serif;margin:0;color:#1b1b1b'><div style='max-width:640px;margin:0 auto;padding:36px 28px'>"
+                        + "<div style='font-size:13px;color:#52514e;margin-bottom:18px'>USB LAN Printer Bridge on " + WebEncode(Environment.MachineName) + " · " + WebEncode(hostOnly) + "</div>"
+                        + "<style>.ok{display:flex;align-items:center;gap:14px}h1{font-size:24px;margin:0}p{font-size:15px;line-height:1.55}.box{border:1px solid #e3e3e0;border-radius:8px;padding:14px 16px;background:#fcfcfb;margin-top:18px}.btn{display:inline-block;background:#0b5bd3;color:#fff;text-decoration:none;font-weight:600;padding:9px 14px;border-radius:4px;margin-top:8px}</style>"
+                        + body
+                        + "<div class=box><b>Prefer no warning at all, on every browser and app on this device?</b><p style='margin:8px 0 0 0;font-size:13px;color:#52514e'>Install the bridge's certificate once. Windows: open the file, Install Certificate, Local Machine, Trusted Root Certification Authorities. Android: Settings, Security, Install a certificate, CA certificate. iOS: install the profile, then enable full trust under Certificate Trust Settings.</p>"
+                        + "<a class=btn href='" + WebEncode(cerLink) + "'>Download UsbLanPrinterBridge.cer</a></div>"
+                        + "<p style='font-size:12px;color:#52514e'>Self-signed certificate for this bridge." + WebEncode(sans) + WebEncode(validity) + "</p>"
+                        + "</div></body>";
+            await WriteResponse(stream, 200, "OK", "text/html; charset=utf-8", Encoding.UTF8.GetBytes(html), origin, null).ConfigureAwait(false);
         }
 
         private async Task WriteStatusPage(Stream stream, string origin)
