@@ -40,7 +40,6 @@ namespace UsbLanPrinterBridge.UI
         private readonly ProbeListener _probe = new ProbeListener();
         private ToolStripMenuItem _miTrace;
         private ToolStripMenuItem _miSaveRaw;
-        private PrintLogForm _printLog;
 
         // NO CUT (per-printer emergency cutter bypass) and the printer actions tab
         private DataGridViewCheckBoxColumn _colNoCut;
@@ -65,6 +64,10 @@ namespace UsbLanPrinterBridge.UI
 
         // Device tab, cooling, and the ePOS device id row
         private TableLayoutPanel _layout;
+        private TabPage _tabPrintLog;
+        private PrintLogView _printLogView;
+        private TabDetacher _detacher;
+        private bool _restoringTabs;
         private TabPage _tabDevice;
         private DeviceTab _deviceTab;
         private DeviceMonitor _deviceMonitor;
@@ -216,17 +219,28 @@ namespace UsbLanPrinterBridge.UI
             _copyNoteTimer.Tick += (s, e) => { _copyNoteTimer.Stop(); _lblCopyNote.ForeColor = SystemColors.GrayText; _lblCopyNote.Text = "The bridge answers this id and replies DeviceNotFound to any other, as a real printer does."; };
 
             _tabs = new TabControl { Dock = DockStyle.Fill };
-            _tabLog = new TabPage("Log") { Padding = new Padding(0) };
+            _tabLog = new TabPage("Log") { Name = "log", Padding = new Padding(0) };
             _tabLog.Controls.Add(_log);
-            _tabActions = new TabPage("Printer actions") { Padding = new Padding(0) };
+            _tabActions = new TabPage("Printer actions") { Name = "actions", Padding = new Padding(0) };
             _tabActions.Controls.Add(BuildActionsTab());
-            _tabDevice = new TabPage("Device") { Padding = new Padding(0) };
+            // The print log (every job, with the ticket as it went to the printer) used to be a separate window
+            // behind Ctrl+L; it is a tab now, and like every tab here it can be pulled out into a window again.
+            _tabPrintLog = new TabPage("Print log") { Name = "printlog", Padding = new Padding(0) };
+            _printLogView = new PrintLogView();
+            EventHandler printLogTitle = (s, e) => { string t = "Print log (" + _printLogView.JobCount + ")"; if (_tabPrintLog.Text != t) _tabPrintLog.Text = t; };
+            _printLogView.CountChanged += printLogTitle;
+            printLogTitle(this, EventArgs.Empty);
+            _tabPrintLog.Controls.Add(_printLogView);
+            _tabDevice = new TabPage("Device") { Name = "device", Padding = new Padding(0) };
             _deviceTab = new DeviceTab();
             _tabDevice.Controls.Add(_deviceTab);
             _tabs.TabPages.Add(_tabLog);
             _tabs.TabPages.Add(_tabActions);
+            _tabs.TabPages.Add(_tabPrintLog);
             _tabs.TabPages.Add(_tabDevice);
             _tabs.SelectedIndexChanged += (s, e) => AdjustLayoutForTab();
+            _detacher = new TabDetacher(_tabs, Program.LoadIcon(32));
+            _detacher.Changed += (s, e) => OnTabsDetachedOrDocked();
 
             var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 7, Padding = new Padding(8, 4, 8, 4) };
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
@@ -459,6 +473,7 @@ namespace UsbLanPrinterBridge.UI
             _deviceTab.Attach(_deviceMonitor, _cooling);
             _deviceTab.AttachStore(new ConfigSectionStore(this));
             ApplySettingsFold(_config.IsSectionCollapsed(SettingsSectionKey), false);
+            if (!_options.Minimized) BeginInvoke(new Action(RestoreFloatingTabs));
             _deviceMonitor.Start();
 
             Logger.Info("Configuration: " + ConfigStore.ConfigPath);
@@ -494,6 +509,7 @@ namespace UsbLanPrinterBridge.UI
         private void ShutdownEverything()
         {
             _timer.Stop();
+            if (_detacher != null) { try { _detacher.CloseForExit(); } catch { } }   // their layout stays saved for the next start
             if (_deviceMonitor != null) { try { _deviceMonitor.Stop(); } catch { } }
             if (_cooling != null) { try { _cooling.Dispose(); } catch { } }
             Logger.EntryAdded -= OnLogEntry;
@@ -1705,15 +1721,84 @@ namespace UsbLanPrinterBridge.UI
             finally { SetBusy(false); }
         }
 
+        /// <summary>Ctrl+L: the Print log tab, or its window when the tab has been pulled out.</summary>
         private void ShowPrintLog()
         {
-            if (_printLog == null || _printLog.IsDisposed)
+            FocusBottomTab(_tabPrintLog);
+        }
+
+        private void FocusBottomTab(TabPage page)
+        {
+            if (page == null || _detacher == null) return;
+            Form window = _detacher.WindowOf(page);
+            if (window != null)
             {
-                _printLog = new PrintLogForm();
-                _printLog.FormClosed += (s, e) => _printLog = null;
+                if (window.WindowState == FormWindowState.Minimized) window.WindowState = FormWindowState.Normal;
+                window.Activate();
+                return;
             }
-            _printLog.Show(this);
-            _printLog.BringToFront();
+            _tabs.SelectedTab = page;
+        }
+
+        // ---- bottom tabs that can be pulled out into their own windows
+
+        private TabPage BottomTab(string key)
+        {
+            return _detacher == null ? null : _detacher.AllPages.FirstOrDefault(p => p.Name == key);
+        }
+
+        /// <summary>Pulls a bottom tab ("log", "actions", "printlog", "device") out into its own window.</summary>
+        public bool DetachTab(string key)
+        {
+            TabPage p = BottomTab(key);
+            return p != null && _detacher.Detach(p, null, false) != null;
+        }
+
+        public void DockTab(string key)
+        {
+            TabPage p = BottomTab(key);
+            if (p != null) _detacher.Dock(p);
+        }
+
+        public bool IsTabFloating(string key)
+        {
+            TabPage p = BottomTab(key);
+            return p != null && _detacher.IsFloating(p);
+        }
+
+        /// <summary>The keys of the tabs docked in the main window right now, in order.</summary>
+        public string[] DockedTabs { get { return _tabs.TabPages.Cast<TabPage>().Select(p => p.Name).ToArray(); } }
+
+        private void OnTabsDetachedOrDocked()
+        {
+            AdjustLayoutForTab();
+            if (!_configLoaded || _restoringTabs) return;
+            _config.FloatingTabs = new List<FloatingTabState>();
+            foreach (TabPage p in _detacher.AllPages)
+            {
+                Rectangle? b = _detacher.BoundsOf(p);
+                if (b.HasValue) _config.FloatingTabs.Add(new FloatingTabState { Key = p.Name, X = b.Value.X, Y = b.Value.Y, Width = b.Value.Width, Height = b.Value.Height });
+            }
+            SaveConfig(false);
+        }
+
+        /// <summary>Reopens the tabs that were floating when the app last closed, where they were, if that screen still exists.</summary>
+        private void RestoreFloatingTabs()
+        {
+            if (_config.FloatingTabs == null || _config.FloatingTabs.Count == 0) return;
+            _restoringTabs = true;
+            try
+            {
+                foreach (FloatingTabState st in _config.FloatingTabs.ToArray())
+                {
+                    TabPage p = BottomTab(st.Key);
+                    if (p == null) continue;
+                    var wanted = new Rectangle(st.X, st.Y, st.Width, st.Height);
+                    bool onScreen = Screen.AllScreens.Any(sc => sc.WorkingArea.IntersectsWith(wanted));
+                    _detacher.Detach(p, onScreen ? wanted : (Rectangle?)null, false);
+                }
+            }
+            finally { _restoringTabs = false; }
         }
 
         private void ToggleSaveRaw()

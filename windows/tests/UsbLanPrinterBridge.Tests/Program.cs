@@ -1692,6 +1692,9 @@ namespace UsbLanPrinterBridge.Tests
             int loadOpen = 0, loadFolded = 0, sysOpen = 0, sysFolded = 0;
             string[] cardsBefore = null, cardsAfter = null, blocksAfter = null, keys = null;
             bool settingsFolded = false;
+            string[] tabsBefore = null, tabsWhileFloating = null, tabsAfterDock = null;
+            bool detached = false, floatingReported = false, floatingSaved = false, floatingAfterDock = true;
+            string floatingTitle = null;
             var thread = new Thread(() =>
             {
                 try
@@ -1748,12 +1751,37 @@ namespace UsbLanPrinterBridge.Tests
                                     t.Interval = 1500;
                                     return;
                                 }
-                                t.Stop();
-                                using (var bmp = new Bitmap(form.Width, form.Height))
+                                if (phase == 2)
                                 {
-                                    form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
-                                    bmp.Save(Path.Combine(OutDir, "mainform-device-folded.png"), ImageFormat.Png);
+                                    using (var bmp = new Bitmap(form.Width, form.Height))
+                                    {
+                                        form.DrawToBitmap(bmp, new Rectangle(0, 0, form.Width, form.Height));
+                                        bmp.Save(Path.Combine(OutDir, "mainform-device-folded.png"), ImageFormat.Png);
+                                    }
+                                    // pull the Print log tab out into its own window
+                                    tabsBefore = form.DockedTabs;
+                                    detached = form.DetachTab("printlog");
+                                    tabsWhileFloating = form.DockedTabs;
+                                    floatingReported = form.IsTabFloating("printlog");
+                                    phase = 3;
+                                    t.Interval = 1200;
+                                    return;
                                 }
+                                t.Stop();
+                                foreach (Form f in Application.OpenForms.Cast<Form>().ToArray())
+                                {
+                                    if (f == form || !f.Text.StartsWith("Print log")) continue;
+                                    floatingTitle = f.Text;
+                                    using (var bmp = new Bitmap(f.Width, f.Height))
+                                    {
+                                        f.DrawToBitmap(bmp, new Rectangle(0, 0, f.Width, f.Height));
+                                        bmp.Save(Path.Combine(OutDir, "printlog-floating.png"), ImageFormat.Png);
+                                    }
+                                }
+                                floatingSaved = ConfigStore.Load().FloatingTabs.Any(x => x.Key == "printlog" && x.Width >= 500);
+                                form.DockTab("printlog");
+                                tabsAfterDock = form.DockedTabs;
+                                floatingAfterDock = form.IsTabFloating("printlog");
                                 form.Close();
                             }
                             catch (Exception ex) { failure = ex; t.Stop(); form.Close(); }
@@ -1791,6 +1819,15 @@ namespace UsbLanPrinterBridge.Tests
             Check(saved.IsSectionCollapsed("sys.load") && saved.IsSectionCollapsed("sys.temps") && saved.IsSectionCollapsed("main.settings") && !saved.IsSectionCollapsed("sys.tiles"), "what is folded is saved in the configuration");
             string[] savedCards = saved.GetSectionOrder("device"), savedBlocks = saved.GetSectionOrder("sys");
             Check(savedCards != null && savedCards[0] == "cooling" && savedBlocks != null && savedBlocks[0] == "sys.events", "the dragged order is saved in the configuration");
+
+            // bottom tabs: the print log is a tab, and a tab can be pulled out into its own window and docked back
+            Check(tabsBefore != null && string.Join(",", tabsBefore) == "log,actions,printlog,device", "the print log is a tab beside Log, Printer actions and Device: " + string.Join(",", tabsBefore ?? new string[0]));
+            Check(detached && floatingReported && tabsWhileFloating != null && string.Join(",", tabsWhileFloating) == "log,actions,device", "pulled out, it leaves the tab strip: " + string.Join(",", tabsWhileFloating ?? new string[0]));
+            string floating = Path.Combine(OutDir, "printlog-floating.png");
+            Check(floatingTitle != null && File.Exists(floating) && new FileInfo(floating).Length > 3000, "it lives in a window of its own (\"" + floatingTitle + "\"), screenshot: " + floating);
+            Check(floatingSaved, "the floating window and its place are saved, to be reopened at the next start");
+            Check(!floatingAfterDock && tabsAfterDock != null && string.Join(",", tabsAfterDock) == "log,actions,printlog,device", "docked back, it returns to its old place: " + string.Join(",", tabsAfterDock ?? new string[0]));
+            Check(saved.FloatingTabs.Count == 0, "and the saved layout no longer lists it");
             ConfigStore.DataDirectory = Path.Combine(OutDir, "data");
         }
     }

@@ -94,6 +94,16 @@ namespace UsbLanPrinterBridge.Core
         [XmlAttribute] public string Keys { get; set; }
     }
 
+    /// <summary>A bottom tab of the main window that was pulled out into its own window, and where that window was.</summary>
+    public sealed class FloatingTabState
+    {
+        [XmlAttribute] public string Key { get; set; }
+        [XmlAttribute] public int X { get; set; }
+        [XmlAttribute] public int Y { get; set; }
+        [XmlAttribute] public int Width { get; set; }
+        [XmlAttribute] public int Height { get; set; }
+    }
+
     [XmlRoot("UsbLanPrinterBridge")]
     public sealed class BridgeConfig
     {
@@ -107,7 +117,11 @@ namespace UsbLanPrinterBridge.Core
             NoCutFeedLines = 4;
             CollapsedSections = new List<string>();
             SectionOrders = new List<SectionOrder>();
+            FloatingTabs = new List<FloatingTabState>();
         }
+
+        /// <summary>Bottom tabs pulled out into their own windows, reopened in place at the next start.</summary>
+        public List<FloatingTabState> FloatingTabs { get; set; }
 
         public List<MappingConfig> Mappings { get; set; }
 
@@ -228,6 +242,7 @@ namespace UsbLanPrinterBridge.Core
                     if (cfg.Mappings == null) cfg.Mappings = new List<MappingConfig>();
                     if (cfg.CollapsedSections == null) cfg.CollapsedSections = new List<string>();
                     if (cfg.SectionOrders == null) cfg.SectionOrders = new List<SectionOrder>();
+                    if (cfg.FloatingTabs == null) cfg.FloatingTabs = new List<FloatingTabState>();
                     foreach (MappingConfig m in cfg.Mappings)
                     {
                         if (string.IsNullOrEmpty(m.Id)) m.Id = Guid.NewGuid().ToString("N");

@@ -244,9 +244,15 @@ the problem does not arise: that app is itself a print service, so the phone's P
 
 ## Print log and diagnostics
 
-Every job is recorded: the time, the device that sent it, how it arrived, its size, whether it printed, and a
-readable extract of the text that went to the printer. Open it from **Log → Print log**, or press Ctrl+L.
-Failed jobs are listed too, in red, which is the case that matters when a client is being rejected.
+Every job is recorded: the time, the device that sent it, how it arrived, its size, whether it printed, and the
+ticket as it went to the printer. It is the **Print log** tab at the bottom of the window, next to Log, Printer
+actions and Device; Ctrl+L or **Log → Print log** jumps to it. Failed jobs are listed too, in red, which is the
+case that matters when a client is being rejected.
+
+**Any bottom tab can be pulled out into its own window**, for a second monitor or to keep the orders beside the
+printer list: double-click the tab, drag it off the tab strip, or right-click it. The window carries on exactly
+where the tab was. Close it, or click *Dock back*, and the tab returns to its place. Windows left floating are
+reopened where they were at the next start.
 
 The same rows are appended to a daily CSV in the log folder, so the history survives restarts:
 
