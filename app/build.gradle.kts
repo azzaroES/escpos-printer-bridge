@@ -16,8 +16,8 @@ android {
         // Everything above API 21 is called behind an explicit Build.VERSION guard.
         minSdk = 21
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.2.1"
+        versionCode = 5
+        versionName = "1.3"
     }
 
     buildTypes {

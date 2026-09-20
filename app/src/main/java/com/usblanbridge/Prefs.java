@@ -121,6 +121,51 @@ public final class Prefs {
         p.edit().putString("licenseKey", v == null ? "" : v.trim()).apply();
     }
 
+    /** The device id the ePOS endpoint answers to (the devid in the URL, or createDevice in the SDK). */
+    public String getEposDeviceId() {
+        return com.usblanbridge.core.EposDeviceId.sanitize(p.getString("eposDeviceId", com.usblanbridge.core.EposDeviceId.DEFAULT));
+    }
+
+    public void setEposDeviceId(String v) {
+        p.edit().putString("eposDeviceId", com.usblanbridge.core.EposDeviceId.sanitize(v)).apply();
+    }
+
+    /** HTTPS ePOS port. Cannot be 443 on an unrooted phone. */
+    public int getEposHttpsPort() {
+        return p.getInt("eposHttpsPort", 8443);
+    }
+
+    public void setEposHttpsPort(int v) {
+        p.edit().putInt("eposHttpsPort", v).apply();
+    }
+
+    /** When the cool-down (throttle) ends, as a wall-clock time in ms; 0 when off. */
+    public long getThrottleUntil() {
+        return p.getLong("throttleUntil", 0);
+    }
+
+    public void setThrottleUntil(long v) {
+        p.edit().putLong("throttleUntil", v).apply();
+    }
+
+    /** The last cool-down length the user chose, in minutes. */
+    public int getThrottleMinutes() {
+        return p.getInt("throttleMinutes", 15);
+    }
+
+    public void setThrottleMinutes(int v) {
+        p.edit().putInt("throttleMinutes", v).apply();
+    }
+
+    /** Whether the Device card's telemetry is written to daily CSV files. */
+    public boolean isTelemetryLogged() {
+        return p.getBoolean("telemetry", true);
+    }
+
+    public void setTelemetryLogged(boolean v) {
+        p.edit().putBoolean("telemetry", v).apply();
+    }
+
     /** Emergency switch: remove every cutter command from every ticket. Read on every write, so it applies at once. */
     public boolean isNoCut() {
         return p.getBoolean("noCut", false);
@@ -138,6 +183,24 @@ public final class Prefs {
 
     public void setNoCutFeedLines(int v) {
         p.edit().putInt("noCutFeed", v).apply();
+    }
+
+    /** Whether a section of the screen is folded up. */
+    public boolean isSectionCollapsed(String key, boolean def) {
+        return p.getBoolean("collapsed." + key, def);
+    }
+
+    public void setSectionCollapsed(String key, boolean v) {
+        p.edit().putBoolean("collapsed." + key, v).apply();
+    }
+
+    /** The order the user dragged a group of sections into, as comma-separated keys; null for the default. */
+    public String getSectionOrder(String group) {
+        return p.getString("order." + group, null);
+    }
+
+    public void setSectionOrder(String group, String csv) {
+        p.edit().putString("order." + group, csv).apply();
     }
 
     /** Random device id used only on ROMs that provide no ANDROID_ID. */

@@ -39,6 +39,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import com.usblanbridge.core.BluetoothPrintTarget;
+import com.usblanbridge.core.EposDeviceId;
 import com.usblanbridge.core.License;
 import com.usblanbridge.core.Log;
 import com.usblanbridge.core.NetUtil;
@@ -48,6 +49,8 @@ import com.usblanbridge.core.PrinterScanner;
 import com.usblanbridge.core.RawServer;
 import com.usblanbridge.core.TestReceipt;
 import com.usblanbridge.print.PrintServiceStatus;
+import com.usblanbridge.ui.Sections;
+import com.usblanbridge.ui.Sections.SectionView;
 
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -103,7 +106,40 @@ public final class MainActivity extends Activity {
     private TextView addressView;
     private TextView addressHint;
     private TextView eposView;
+    private TextView httpsView;
+    private TextView copyNote;
     private Button btnStartStop;
+
+    // device cards, ePOS device id
+    private DeviceCards deviceCards;
+    private DeviceMonitor monitor;
+    private EditText devIdField;
+    private TextView devIdNote;
+    private EditText httpsPort;
+
+    // collapsible, draggable sections
+    private Sections.Store sectionStore;
+    private Sections.Column column;
+    private SectionView printerSection, noCutSection, ticketsSection, optionsSection, devIdSection, footerSection;
+
+    private final Runnable hideCopyNote = new Runnable() {
+        @Override
+        public void run() {
+            copyNote.setVisibility(View.GONE);
+        }
+    };
+
+    private final DeviceMonitor.Listener monitorListener = new DeviceMonitor.Listener() {
+        @Override
+        public void onSnapshot(final DeviceMonitor.Snapshot s) {
+            ui.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (resumed) deviceCards.refresh(s);
+                }
+            });
+        }
+    };
 
     // printer card
     private final TextView[] chips = new TextView[ROUTE_MODES.length];
@@ -134,7 +170,6 @@ public final class MainActivity extends Activity {
     private EditText licenceKey;
     private TextView logView;
     private ScrollView logScroll;
-    private Button logToggle;
 
     private final Runnable ticker = new Runnable() {
         @Override
@@ -190,8 +225,32 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         prefs = new Prefs(this);
         Log.setDirectory(getExternalFilesDir(null));
+        sectionStore = new Sections.Store() {
+            @Override
+            public boolean isCollapsed(String key, boolean def) {
+                return prefs.isSectionCollapsed(key, def);
+            }
+
+            @Override
+            public void setCollapsed(String key, boolean collapsed) {
+                prefs.setSectionCollapsed(key, collapsed);
+            }
+
+            @Override
+            public String getOrder(String group) {
+                return prefs.getSectionOrder(group);
+            }
+
+            @Override
+            public void setOrder(String group, String csv) {
+                prefs.setSectionOrder(group, csv);
+            }
+        };
+        deviceCards = new DeviceCards(this, prefs, sectionStore);
+        monitor = DeviceMonitor.get(this);
         setContentView(buildUi());
         Log.i("Log file: " + Log.getLogFile());
+        monitor.addListener(monitorListener);
 
         IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
@@ -219,17 +278,24 @@ public final class MainActivity extends Activity {
         refreshStatus();
         ui.removeCallbacks(ticker);
         ui.postDelayed(ticker, 2000);
+        monitor.acquire("activity");
+        monitor.setVisible(true);
+        DeviceMonitor.Snapshot last = monitor.last();
+        if (last != null) deviceCards.refresh(last);
     }
 
     @Override
     protected void onPause() {
         resumed = false;
         ui.removeCallbacks(ticker);
+        monitor.setVisible(false);
+        monitor.release("activity");
         super.onPause();
     }
 
     @Override
     protected void onDestroy() {
+        monitor.removeListener(monitorListener);
         Log.removeListener(logListener);
         PrintHistory.removeListener(historyListener);
         try {
@@ -248,13 +314,25 @@ public final class MainActivity extends Activity {
 
         root.addView(buildHeader());
         root.addView(buildActions());
-        root.addView(buildPrinterCard());
-        root.addView(buildEmergencyCard());
-        root.addView(buildTicketsCard());
-        root.addView(buildOptionsCard());
-        root.addView(buildPrintServiceCard());
-        root.addView(buildFooterCard());
-        root.addView(buildLogCard());
+
+        // Every card is a section: tap its heading to fold it, drag its grip to move it. Order and folds are kept.
+        column = new Sections.Column(this, "main", sectionStore);
+        column.add(buildPrinterCard());
+        column.add(buildEmergencyCard());
+        column.add((SectionView) deviceCards.deviceCard());
+        column.add((SectionView) deviceCards.batteryCard());
+        column.add((SectionView) deviceCards.coolDownCard());
+        column.add(buildEposIdCard());
+        column.add(buildTicketsCard());
+        column.add(buildOptionsCard());
+        column.add(buildPrintServiceCard());
+        column.add(buildFooterCard());
+        column.add(buildLogCard());
+        column.applySavedOrder();
+        root.addView(column, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView foot = hintText("Tap a card's heading to fold it; drag ≡ to put the cards in the order you want. The app remembers both.");
+        foot.setGravity(Gravity.CENTER);
+        root.addView(foot);
 
         ScrollView outer = new ScrollView(this);
         outer.setFillViewport(true);
@@ -307,16 +385,151 @@ public final class MainActivity extends Activity {
         eposView = text("", 12, ON_PRIMARY_MUTED, false);
         eposView.setPadding(0, dp(8), 0, 0);
         eposView.setTypeface(Typeface.MONOSPACE);
+        eposView.setContentDescription("epos_line");
         eposView.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                String s = eposView.getText().toString();
-                int at = s.indexOf("http");
-                if (at >= 0) copyToClipboard("ePOS endpoint", s.substring(at), "ePOS address copied");
+                copyEposLink(false);
             }
         });
         header.addView(eposView);
+
+        httpsView = text("", 12, ON_PRIMARY_MUTED, false);
+        httpsView.setPadding(0, dp(2), 0, 0);
+        httpsView.setTypeface(Typeface.MONOSPACE);
+        httpsView.setContentDescription("https_line");
+        httpsView.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyEposLink(true);
+            }
+        });
+        header.addView(httpsView);
+
+        LinearLayout links = new LinearLayout(this);
+        links.setOrientation(LinearLayout.HORIZONTAL);
+        Button copyEpos = headerButton("Copy ePOS link", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyEposLink(false);
+            }
+        });
+        copyEpos.setContentDescription("btn_copy_epos");
+        Button copyCert = headerButton("Copy certificate link", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyCertificateLink();
+            }
+        });
+        copyCert.setContentDescription("btn_copy_cert");
+        LinearLayout.LayoutParams b1 = new LinearLayout.LayoutParams(0, dp(36), 1f);
+        LinearLayout.LayoutParams b2 = new LinearLayout.LayoutParams(0, dp(36), 1f);
+        b2.leftMargin = dp(8);
+        links.addView(copyEpos, b1);
+        links.addView(copyCert, b2);
+        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        llp.topMargin = dp(10);
+        header.addView(links, llp);
+
+        copyNote = text("", 11.5f, Color.WHITE, false);
+        copyNote.setPadding(dp(10), dp(6), dp(10), dp(6));
+        copyNote.setBackground(rounded(0x33FFFFFF, 8));
+        copyNote.setVisibility(View.GONE);
+        copyNote.setContentDescription("copy_note");
+        LinearLayout.LayoutParams nlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        nlp.topMargin = dp(8);
+        header.addView(copyNote, nlp);
         return header;
+    }
+
+    private Button headerButton(String label, View.OnClickListener onClick) {
+        Button b = button(label, onClick);
+        b.setTextSize(12.5f);
+        b.setTextColor(Color.WHITE);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setBackground(outlined(0x99FFFFFF, 0x22FFFFFF, 10));
+        b.setPadding(dp(6), 0, dp(6), 0);
+        return b;
+    }
+
+    private SectionView section(String key, String title) {
+        return new SectionView(this, key, title, true, CARD, sectionStore);
+    }
+
+    /** The card where the ePOS device id is set: the name POS apps put in the URL or in createDevice. */
+    private SectionView buildEposIdCard() {
+        LinearLayout card = body();
+        devIdSection = section("devid", "ePOS device id");
+        devIdSection.setContentDescription("card_devid");
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        devIdField = edit(prefs.getEposDeviceId(), "local_printer", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS, 1f);
+        devIdField.setContentDescription("field_devid");
+        row.addView(labelled("Answer to", devIdField));
+        Button apply = smallButton("Apply", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                applyDeviceId(true);
+            }
+        });
+        apply.setContentDescription("btn_devid_apply");
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40));
+        alp.leftMargin = dp(8);
+        row.addView(apply, alp);
+        card.addView(row);
+        devIdField.setOnFocusChangeListener(new View.OnFocusChangeListener() {
+            @Override
+            public void onFocusChange(View v, boolean hasFocus) {
+                if (!hasFocus) applyDeviceId(false);
+            }
+        });
+        devIdNote = hintText("");
+        card.addView(devIdNote);
+        card.addView(hintText("The name a POS app puts in the ePOS URL (?devid=) or in createDevice. Default local_printer, or name it after the "
+                + "printer, for example kitchen. A request naming another id gets DeviceNotFound, as a real printer answers. "
+                + "The header links and Copy ePOS link use this id. Letters, digits, '_', '-' and '.' only, up to 32."));
+        return devIdSection.content(card);
+    }
+
+    private void applyDeviceId(boolean announce) {
+        String wanted = EposDeviceId.sanitize(devIdField.getText().toString());
+        if (!wanted.equals(devIdField.getText().toString())) devIdField.setText(wanted);
+        if (wanted.equals(prefs.getEposDeviceId())) {
+            if (announce) toast("Answering to \"" + wanted + "\".");
+            return;
+        }
+        prefs.setEposDeviceId(wanted);
+        Log.i("ePOS device id set to \"" + wanted + "\"; the endpoint answers it at once.");
+        if (announce) toast("Answering to \"" + wanted + "\".");
+        refreshStatus();
+    }
+
+    private String linkHost() {
+        String ip = NetUtil.getLanAddress();
+        return ip == null ? "<phone address>" : ip;
+    }
+
+    private void copyEposLink(boolean https) {
+        int port = https ? parsePort(httpsPort.getText().toString(), 8443) : parsePort(eposPort.getText().toString(), 8080);
+        String url = EposDeviceId.serviceUrl(https, linkHost(), port, prefs.getEposDeviceId());
+        copyToClipboard("ePOS link", url, "ePOS link copied");
+        showCopyNote("Copied " + url + ". Paste it into the POS app; in the SDK the same id goes into createDevice."
+                + (https ? " HTTPS: open the certificate link once on that device first." : ""));
+    }
+
+    private void copyCertificateLink() {
+        String url = EposDeviceId.certificateUrl(linkHost(), parsePort(httpsPort.getText().toString(), 8443));
+        copyToClipboard("Certificate link", url, "Certificate link copied");
+        showCopyNote("Copied " + url + ". Open it once on each device that prints from an https page and accept the warning; "
+                + "the page then confirms the device trusts the bridge, and offers the .cer file for a permanent install.");
+    }
+
+    private void showCopyNote(String text) {
+        copyNote.setText(text);
+        copyNote.setVisibility(View.VISIBLE);
+        ui.removeCallbacks(hideCopyNote);
+        ui.postDelayed(hideCopyNote, 8000);
     }
 
     /** One big Start/Stop button and the test print beside it. */
@@ -352,8 +565,9 @@ public final class MainActivity extends Activity {
         return row;
     }
 
-    private View buildPrinterCard() {
-        LinearLayout card = card("Printer");
+    private SectionView buildPrinterCard() {
+        LinearLayout card = body();
+        printerSection = section("printer", "Printer");
 
         // Route chips
         LinearLayout chipRow = new LinearLayout(this);
@@ -455,24 +669,13 @@ public final class MainActivity extends Activity {
         card.addView(detectRow);
 
         selectRoute(indexOfRoute(prefs.getTargetMode()), false);
-        return card;
+        return printerSection.content(card);
     }
 
-    private View buildEmergencyCard() {
-        LinearLayout card = card(null);
-        card.setBackground(rounded(RED_BG, 14));
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout texts = new LinearLayout(this);
-        texts.setOrientation(LinearLayout.VERTICAL);
-        texts.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        texts.addView(text("NO CUT  ·  emergency", 16, RED_TEXT, true));
+    private SectionView buildEmergencyCard() {
+        noCutSection = new SectionView(this, "nocut", "NO CUT · emergency", true, RED_BG, sectionStore).titleColor(RED_TEXT);
         noCutText = text("", 13, RED_TEXT, false);
-        noCutText.setPadding(0, dp(4), dp(8), 0);
-        texts.addView(noCutText);
-        row.addView(texts);
+        noCutText.setPadding(dp(4), dp(2), dp(8), 0);
 
         noCutSwitch = new Switch(this);
         noCutSwitch.setChecked(prefs.isNoCut());
@@ -489,13 +692,13 @@ public final class MainActivity extends Activity {
                 refreshStatus();
             }
         });
-        row.addView(noCutSwitch);
-        card.addView(row);
-        return card;
+        noCutSection.extraFill(noCutSwitch);
+        return noCutSection.content(noCutText);
     }
 
-    private View buildTicketsCard() {
-        LinearLayout card = card("Last tickets");
+    private SectionView buildTicketsCard() {
+        LinearLayout card = body();
+        ticketsSection = section("tickets", "Last tickets");
         ticketsEmpty = hintText("Nothing printed yet. Each ticket that goes through the phone is listed here; tap one to see it as it went to the printer.");
         card.addView(ticketsEmpty);
         ticketsBox = new LinearLayout(this);
@@ -508,11 +711,12 @@ public final class MainActivity extends Activity {
                 refreshTickets();
             }
         })));
-        return card;
+        return ticketsSection.content(card);
     }
 
-    private View buildOptionsCard() {
-        LinearLayout card = card("Options");
+    private SectionView buildOptionsCard() {
+        LinearLayout card = body();
+        optionsSection = section("options", "Options");
 
         LinearLayout portRow = new LinearLayout(this);
         portRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -520,12 +724,19 @@ public final class MainActivity extends Activity {
         rawPort.setContentDescription("field_raw_port");
         eposPort = edit(String.valueOf(prefs.getEposPort()), "ePOS port", InputType.TYPE_CLASS_NUMBER, 1f);
         eposPort.setContentDescription("field_epos_port");
+        httpsPort = edit(String.valueOf(prefs.getEposHttpsPort()), "HTTPS port", InputType.TYPE_CLASS_NUMBER, 1f);
+        httpsPort.setContentDescription("field_https_port");
         portRow.addView(labelled("Raw port (9100)", rawPort));
         View eposBox = labelled("ePOS port (8080)", eposPort);
         ((LinearLayout.LayoutParams) eposBox.getLayoutParams()).leftMargin = dp(8);
         portRow.addView(eposBox);
+        View httpsBox = labelled("HTTPS port (8443)", httpsPort);
+        ((LinearLayout.LayoutParams) httpsBox.getLayoutParams()).leftMargin = dp(8);
+        portRow.addView(httpsBox);
         card.addView(portRow);
-        card.addView(hintText("Raw works from an IP address alone. ePOS cannot use port 80 on an unrooted phone, so ePOS clients must include the port in the URL."));
+        card.addView(hintText("Raw works from an IP address alone. ePOS cannot use ports 80 or 443 on an unrooted phone, so ePOS clients must "
+                + "include the port in the URL. HTTPS uses a self-signed certificate the phone makes for its own address; each client device "
+                + "accepts it once at the certificate link. Port changes apply at the next start."));
 
         statusReplies = new Switch(this);
         statusReplies.setChecked(prefs.isStatusReplies());
@@ -534,11 +745,11 @@ public final class MainActivity extends Activity {
         autoStart = new Switch(this);
         autoStart.setChecked(prefs.isAutoStart());
         card.addView(switchRow("Start sharing after a reboot", "The bridge comes back on its own when the phone restarts.", autoStart));
-        return card;
+        return optionsSection.content(card);
     }
 
-    private View buildPrintServiceCard() {
-        LinearLayout card = card("Print from any app");
+    private SectionView buildPrintServiceCard() {
+        LinearLayout card = body();
         printServiceView = text("", 13, MUTED, false);
         card.addView(printServiceView);
         card.addView(buttonRow(button("Android print settings", new View.OnClickListener() {
@@ -547,11 +758,12 @@ public final class MainActivity extends Activity {
                 openPrintSettings();
             }
         })));
-        return card;
+        return section("printservice", "Print from any app").content(card);
     }
 
-    private View buildFooterCard() {
-        LinearLayout card = card("Ticket footer & licence");
+    private SectionView buildFooterCard() {
+        LinearLayout card = body();
+        footerSection = section("footer", "Ticket footer & licence");
         footerView = text("", 13, MUTED, false);
         card.addView(footerView);
         licenceKey = edit(prefs.getLicenseKey(), "Licence key", InputType.TYPE_CLASS_TEXT, 1f);
@@ -570,35 +782,18 @@ public final class MainActivity extends Activity {
                         copyDeviceId();
                     }
                 })));
-        return card;
+        return footerSection.content(card);
     }
 
-    private View buildLogCard() {
-        LinearLayout card = card(null);
-        LinearLayout head = new LinearLayout(this);
-        head.setOrientation(LinearLayout.HORIZONTAL);
-        head.setGravity(Gravity.CENTER_VERTICAL);
-        TextView title = text("Log", 15, TEXT, true);
-        title.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        head.addView(title);
+    private SectionView buildLogCard() {
+        SectionView sec = section("log", "Log");
         Button copy = smallButton("Copy", new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 copyToClipboard("Bridge log", logView.getText().toString(), "Log copied");
             }
         });
-        head.addView(copy);
-        logToggle = smallButton("Hide", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                boolean show = logScroll.getVisibility() != View.VISIBLE;
-                logScroll.setVisibility(show ? View.VISIBLE : View.GONE);
-                logToggle.setText(show ? "Hide" : "Show");
-            }
-        });
-        ((LinearLayout.LayoutParams) logToggle.getLayoutParams()).leftMargin = dp(6);
-        head.addView(logToggle);
-        card.addView(head);
+        sec.extra(copy);
 
         logView = new TextView(this);
         logView.setTypeface(Typeface.MONOSPACE);
@@ -609,11 +804,20 @@ public final class MainActivity extends Activity {
         logScroll = new ScrollView(this);
         logScroll.setBackground(rounded(LOG_BG, 10));
         logScroll.addView(logView);
+        LinearLayout card = body();
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220));
         lp.topMargin = dp(8);
         logScroll.setLayoutParams(lp);
         card.addView(logScroll);
-        return card;
+        return sec.content(card);
+    }
+
+    /** The body of a section: a plain vertical box; the section supplies the card, heading and spacing. */
+    private LinearLayout body() {
+        LinearLayout b = new LinearLayout(this);
+        b.setOrientation(LinearLayout.VERTICAL);
+        b.setPadding(dp(4), 0, 0, 0);
+        return b;
     }
 
     // ------------------------------------------------------------------ widget helpers
@@ -1053,6 +1257,8 @@ public final class MainActivity extends Activity {
         prefs.setTcpPort(parsePort(tcpPort.getText().toString(), 9100));
         prefs.setRawPort(parsePort(rawPort.getText().toString(), 9100));
         prefs.setEposPort(parsePort(eposPort.getText().toString(), 8080));
+        prefs.setEposHttpsPort(parsePort(httpsPort.getText().toString(), 8443));
+        prefs.setEposDeviceId(devIdField.getText().toString());
         prefs.setStatusReplies(statusReplies.isChecked());
         prefs.setAutoStart(autoStart.isChecked());
         prefs.setNoCut(noCutSwitch.isChecked());
@@ -1181,11 +1387,26 @@ public final class MainActivity extends Activity {
         String ip = NetUtil.getLanAddress();
         int raw = parsePort(rawPort.getText().toString(), 9100);
         int epos = parsePort(eposPort.getText().toString(), 8080);
+        int https = parsePort(httpsPort.getText().toString(), 8443);
+        String devid = prefs.getEposDeviceId();
         setText(addressView, ip == null ? "No Wi-Fi" : ip + ":" + raw);
         setText(addressHint, ip == null
                 ? "Join a Wi-Fi network; POS devices reach the phone over it."
                 : "Tap to copy. Raw printing, works from an IP address alone.");
-        setText(eposView, ip == null || !prefs.isEposEnabled() ? "" : "ePOS: http://" + ip + ":" + epos + "/cgi-bin/epos/service.cgi");
+        String host = ip == null ? "<phone address>" : ip;
+        setText(eposView, !prefs.isEposEnabled() ? "" : "ePOS  " + EposDeviceId.serviceUrl(false, host, epos, devid).replace("&timeout=10000", ""));
+        boolean httpsUp = BridgeService.httpsServer() != null;
+        setText(httpsView, !prefs.isEposEnabled() ? "" : "HTTPS " + EposDeviceId.serviceUrl(true, host, https, devid).replace("&timeout=10000", "")
+                + (httpsUp || !BridgeService.isRunning() ? "" : "  (not running, see the log)"));
+        if (!devIdField.hasFocus() && !devIdField.getText().toString().equals(devid)) devIdField.setText(devid);
+        setText(devIdNote, "Answering to \"" + devid + "\"" + (devid.equals(EposDeviceId.DEFAULT) ? " (the default a real Epson uses)." : ". Other ids get DeviceNotFound."));
+
+        // what each folded card says in its heading
+        devIdSection.setSummary(devid);
+        noCutSection.setSummary(prefs.isNoCut() ? "ON" : "off");
+        printerSection.setSummary(ROUTE_LABELS[route] + (route == 3 ? " · " + prefs.getTcpHost() + ":" + prefs.getTcpPort() : ""));
+        optionsSection.setSummary(raw + " · " + epos + " · " + https);
+        footerSection.setSummary(prefs.getLicenseKey().isEmpty() ? "footer printed" : "licensed");
 
         RawServer server = BridgeService.rawServer();
         boolean running = BridgeService.isRunning() && server != null;
@@ -1219,6 +1440,7 @@ public final class MainActivity extends Activity {
         ticketsBox.removeAllViews();
         List<PrintHistory.Record> all = PrintHistory.snapshot();
         ticketsEmpty.setVisibility(all.isEmpty() ? View.VISIBLE : View.GONE);
+        ticketsSection.setSummary(all.isEmpty() ? "none yet" : all.size() + (all.size() == 1 ? " ticket" : " tickets") + " · last " + all.get(all.size() - 1).timeText().substring(11));
         int shown = 0;
         for (int i = all.size() - 1; i >= 0 && shown < MAX_TICKETS; i--, shown++) {
             final PrintHistory.Record r = all.get(i);

@@ -10,13 +10,17 @@ the loop. Old phones make good dedicated print servers, which is the point.
 * **No dependencies.** Plain Android framework, no AndroidX and no vendor SDKs, so it stays under 1 MB.
 * **Four printer routes**: USB over OTG, a Sunmi-style built-in printer, Bluetooth, or relaying to a printer that
   is already on the network.
-* **Raw / JetDirect on port 9100** and **Epson ePOS-Print emulation over HTTP**, so apps written against the Epson
-  ePOS SDK can print to any generic ESC/POS printer.
+* **Raw / JetDirect on port 9100** and **Epson ePOS-Print emulation over HTTP and HTTPS**, so apps written
+  against the Epson ePOS SDK, including pages served over https, can print to any generic ESC/POS printer. The
+  device id is yours to set, and the certificate link a client visits once is a tap away.
 * **An Android print service**: the phone's own Print menu, in every app, lists the printers this phone can reach,
   and pages print as they look on screen.
 * **NO CUT emergency switch**: every cutter command is removed from every ticket and the paper is fed to the tear
   bar instead. For a jammed or broken cutter; applies at once.
 * **The last tickets, as they went to the printer**, line by line, on the main screen.
+* **Device, battery and cool-down cards**: USB, Wi-Fi, Bluetooth, processor, RAM and temperatures as tiles and
+  60-second graphs with every printer event marked on the same timeline; a battery card that flips over to
+  everything Android reports; a cool-down timer that throttles the bridge itself. All logged to a telemetry CSV.
 * Runs as a foreground service holding a Wi-Fi lock and a wake lock, so printing keeps working with the screen off.
   It can also start itself after a reboot, and announces itself on the Wi-Fi so other phones find it.
 
@@ -32,30 +36,94 @@ Get the APK from the [Releases page](https://github.com/azzaroES/escpos-printer-
 ## The screen
 
 One screen, built from cards. The blue header shows the address to type into POS software in large type (tap
-to copy), the ePOS URL under it, and a live status pill: running, with the job and client counts, or stopped.
-Below it one big **Start sharing / Stop sharing** button and **Test print**. Then:
+to copy), the ePOS http and https links with the device id under it, **Copy ePOS link** and **Copy certificate
+link**, and a live status pill: running, with the job and client counts, or stopped. Below it one big **Start
+sharing / Stop sharing** button and **Test print**. Then:
 
 * **Printer**: four chips, USB, Built-in, Bluetooth, Network. Only the chosen route's controls are shown: the USB
   device list with Refresh and Grant access, the Bluetooth chooser, or the network address with the subnet scan.
   **Detect printers on this device** picks the best route automatically.
 * **NO CUT · emergency**: a red card with a switch, described below.
+* **Device**, **Battery** and **Cool-down · throttle**: described below.
+* **ePOS device id**: the id the endpoint answers to.
 * **Last tickets**: the last eight jobs with time, sender, size and result. Tap one to see the ticket as it went
   to the printer, line by line, and copy it.
-* **Options** (ports, status replies, start after reboot), **Print from any app**, **Ticket footer & licence**,
-  and the **Log**, which can be hidden or copied.
+* **Options** (raw, ePOS and HTTPS ports, status replies, start after reboot), **Print from any app**, **Ticket
+  footer & licence**, and the **Log**, which can be hidden or copied.
 
 ## What clients connect to
 
 | | Port | Works from an IP alone |
 |---|---|---|
 | Raw / JetDirect | 9100 | yes |
-| ePOS-Print | 8080 | no, the port must be in the URL |
+| ePOS-Print over HTTP | 8080 | no, the port must be in the URL |
+| ePOS-Print over HTTPS | 8443 | no, the port must be in the URL |
 
 **That port difference is a platform limit, not a choice.** An unrooted Android app may not bind ports below 1024,
-so the phone cannot answer on 80 the way the Windows build does. Raw 9100 is unaffected, which is why it stays the
-path that works when a POS app only asks for an IP address.
+so the phone cannot answer on 80 or 443 the way the Windows build does. Raw 9100 is unaffected, which is why it
+stays the path that works when a POS app only asks for an IP address.
 
-The ePOS endpoint is `http://<phone address>:8080/cgi-bin/epos/service.cgi` with device id `local_printer`.
+The ePOS endpoint is `http://<phone address>:8080/cgi-bin/epos/service.cgi?devid=local_printer`, or the same path
+on `https://<phone address>:8443`.
+
+### ePOS over HTTPS, the device id and the certificate link
+
+A POS page served over https cannot call an http address, so the phone serves the same ePOS endpoint over
+**HTTPS on port 8443**. The certificate is self-signed, made by the phone for its own addresses and remade when
+the address changes; it is built by hand in DER rather than through the Android keystore, because before Android 9
+the keystore signs self-signed certificates with a placeholder that browsers reject outright. Each client device
+trusts it once: **Copy certificate link** in the header copies `https://<phone address>:8443/cert`; open it on
+the client, accept the warning, and the page confirms the device now trusts the bridge and offers the `.cer` for a
+permanent install.
+
+The endpoint answers the **device id** set in the "ePOS device id" card, `local_printer` by default or a name
+such as `kitchen`, and replies `DeviceNotFound` to any other, as a real printer would. The header shows both the
+http and the https link with `?devid=` filled in, and **Copy ePOS link** copies the http one ready to paste (tap
+the https line to copy that one). A change of id applies at once, without restarting the bridge.
+
+When a client gets this wrong the log says so in words: a client that speaks HTTPS to the http port is named,
+with the port to use instead; a client that speaks plain http to the https port fails its handshake and the log
+points at the certificate page; and a request that never completes is logged with its request line, so "Read
+timed out" is never the whole story.
+
+## The Device, Battery and Cool-down cards
+
+**Device**, refreshed every second while the app is open: tiles for **USB** (the printer on the OTG cable and
+whether access was granted), **Wi-Fi** (signal, link speed, traffic), **Bluetooth** (the chosen printer and
+whether it is paired or in use), **Processor**, **RAM**, **Video** and **Temperatures**. Each tile says how the
+reading was obtained: **LIVE** from Android, **EST** for the closest an app is allowed (Android hides system CPU
+load since 8.0, so the processor tile shows the cores' clock as a share of their maximum), **N/A** where Android
+gives apps nothing (GPU load). Temperatures come from the battery sensor always, from the CPU thermal zone where
+the phone lets an app read it, and from Android's own thermal status (none, light, moderate, severe) on Android
+10 and newer. Under the tiles: the load and temperature graphs of the last 60 seconds with a touch crosshair and
+tooltip, **every printer event marked on the same timeline** (printed, cut removed, printer not answering, job
+failed) and listed below with its time, and strips of when the USB and Bluetooth printers were available.
+
+**Battery**: the level in large type with the state, charger, current and temperature; a graph of the level per
+minute over the last hour and bars of the current in and out (tap for the values at that minute); and, on the
+flip side, everything Android reports: state, source, current now and average, voltage, power, temperature,
+charge counter, health, technology, time to full, and the cycle count on Android 14. Design capacity and wear are
+not exposed to apps without root, so they are not shown.
+
+**Cool-down · throttle**: Android lets no app slow the CPU or drive the fans, so the bridge throttles itself for
+the minutes you set: it drops the high-performance Wi-Fi lock for the normal one, pauses the announcement on the
+network, rasterises Print-menu pages at 100 dpi instead of 203, and reads the sensors every 30 seconds in the
+background. Prints still go through. The card counts down, shows Android's thermal status, and has a button to
+the system's own battery saver. Everything comes back when the timer ends or you stop it early.
+
+**Telemetry log**: every tile, both graphs and every event go to
+`Android/data/com.usblanbridge/files/telemetry-YYYYMMDD.csv`, one row every five seconds with a full timestamp,
+kept for 14 days. The panel on the Device card shows today's file and size, **Share log file** hands it to any
+app (mail, Drive, WhatsApp), and **Clear telemetry logs…** deletes the files after a confirmation. The switch
+next to it turns the log off.
+
+## Fold and reorder the screen
+
+Every card on the screen, and every block inside the Device and Battery cards, is an accordion section. Tap a
+heading to fold it; a folded card keeps a one-line summary in its heading (`CPU 39 % · RAM 37 % · Wi-Fi 96 % ·
+30 °C`, `9100 · 8080 · 8443`, `2 tickets · last 16:39:36`) and the controls that matter, such as the NO CUT
+switch and the log's Copy button, stay in the heading. Drag the **≡** grip to move a card, or a block inside its
+card, where you want it; the page scrolls while you drag near its edge. Folds and order are remembered.
 
 ## The phone's own Print menu, with no other app
 
@@ -167,18 +235,23 @@ practical on a phone.
 ## Logs
 
 Some ROMs hide app output from `logcat`, so the app writes its own log to
-`Android/data/com.usblanbridge/files/bridge.log` on the device's storage, alongside a daily print-history CSV.
-The **Last tickets** card on the main screen shows the recent jobs and, on tap, each ticket as it went to the
-printer.
+`Android/data/com.usblanbridge/files/bridge.log` on the device's storage, alongside a daily print-history CSV
+and the daily telemetry CSV described above. The **Last tickets** card on the main screen shows the recent jobs
+and, on tap, each ticket as it went to the printer.
 
 ## What has and has not been tested on hardware
 
 | Path | Status |
 |---|---|
 | App, foreground service, listening on 9100 and 8080 | verified on a real phone (Ulefone Armor 9E, Android 10) |
-| The new screen: start from the UI, route chips, NO CUT switch | verified on that phone |
+| The screen: start from the UI, route chips, NO CUT switch | verified on that phone |
+| ePOS over http from a PC | verified against that phone: preflight and print succeed |
+| Device monitor and telemetry CSV | verified on that phone: rows with CPU clock, RAM, Wi-Fi, battery current, voltage and temperature; the CPU thermal zone is not readable on Android 10, so that column is empty there |
+| The Device, Battery and Cool-down cards | verified on that phone from screenshots: tiles, both graphs with the touch tooltip, the strips, the battery card's two faces, a cool-down started and stopped (discovery paused and announced again) |
+| Folding and dragging sections | verified on that phone: cards and blocks folded, a card dragged to the top, and both restored after a restart of the app |
+| ePOS over HTTPS, the certificate page and the device id | verified from a PC against that phone: the `/cert` page and the `.cer` download over https, a ticket printed over https, `DeviceNotFound` for another id, and the log naming a client that spoke HTTPS to the http port. Also 21 desktop checks that start the real server on both schemes. **Not yet opened from a phone or tablet browser** |
 | ESC/POS responder | 24 checks against bytes captured from a real Epson TM-T20II |
-| Raster encoder, ticket footer, NO CUT filter, ticket renderer, licence check | 53 desktop checks |
+| Raster encoder, ticket footer, NO CUT filter, ticket renderer, licence check, certificate builder, telemetry log, event list | 93 desktop checks |
 | Network scan | logic verified against a live LAN, where it identified a TM-T20II from its `GS I 67` reply |
 | Forwarding to a network printer | verified from that phone to an Epson TM printer on the LAN, test receipt and a raw ticket from a PC |
 | NO CUT on a real ticket | verified on that path: the log names the `GS V 66 0` removed and the 4-line feed sent instead |
@@ -219,11 +292,16 @@ tools\run-responder-test.cmd
 ```
 
 That runs 24 checks of `EscPosResponder` against the values captured from a real Epson TM-T20II, including the
-`GS ( H` process-id echo at every possible TCP split point, followed by 53 checks of the raster encoder behind
+`GS ( H` process-id echo at every possible TCP split point, followed by 93 checks of the raster encoder behind
 the Print menu, the footer injector (including cut bytes hidden inside image and QR payloads, and every possible
 split point), the NO CUT filter (every cut form, payload bytes that spell a cut, every split point, the switch
-flipped mid-job, the footer and the filter stacked), the ticket renderer and the licence check (forged and
-mismatched keys are rejected).
+flipped mid-job, the footer and the filter stacked), the ticket renderer, the licence check (forged and
+mismatched keys are rejected), the hand-built HTTPS certificate (DER primitives, a parse and signature check by
+the platform's own X.509 parser, reuse and regeneration on disk, and a real TLS handshake against it), the device
+id rules and links, the telemetry CSV and the event list. A third run of 21 checks starts the ePOS server itself
+on both http and https, with Android's logcat stubbed, and talks to it as a browser would: the CORS preflight,
+prints with the right and the wrong device id, the certificate page and download over both schemes, HTTPS spoken
+to the http port, plain http spoken to the https port, and a broken document.
 
 ## License
 

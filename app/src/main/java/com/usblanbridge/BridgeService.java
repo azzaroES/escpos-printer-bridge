@@ -19,16 +19,21 @@ import android.os.PowerManager;
 
 import com.usblanbridge.core.BluetoothPrintTarget;
 import com.usblanbridge.core.EposHttpServer;
+import com.usblanbridge.core.EventLog;
 import com.usblanbridge.core.Log;
 import com.usblanbridge.core.NetUtil;
 import com.usblanbridge.core.PrintTarget;
 import com.usblanbridge.core.RawServer;
 import com.usblanbridge.core.SunmiPrintTarget;
 import com.usblanbridge.core.TcpPrintTarget;
+import com.usblanbridge.core.TlsCertificate;
 import com.usblanbridge.core.UsbPrintTarget;
 import com.usblanbridge.print.PrinterCatalog;
 
+import java.io.File;
 import java.util.HashMap;
+
+import javax.net.ssl.SSLServerSocketFactory;
 
 /**
  * Keeps the printer shared while the app is in the background or the screen is off.
@@ -49,6 +54,8 @@ public final class BridgeService extends Service {
 
     private RawServer rawServer;
     private EposHttpServer eposServer;
+    private EposHttpServer httpsServer;
+    private volatile int rawPort;
     private UsbPrintTarget usbTarget;
     private SunmiPrintTarget sunmiTarget;
     private BluetoothPrintTarget bluetoothTarget;
@@ -74,6 +81,23 @@ public final class BridgeService extends Service {
     public static RawServer rawServer() {
         BridgeService s = instance;
         return s == null ? null : s.rawServer;
+    }
+
+    /** The HTTPS ePOS endpoint while it is up, or null. */
+    public static EposHttpServer httpsServer() {
+        BridgeService s = instance;
+        EposHttpServer h = s == null ? null : s.httpsServer;
+        return h != null && h.isRunning() ? h : null;
+    }
+
+    /** Applies or lifts the cool-down while the bridge runs: Wi-Fi lock mode and network discovery. */
+    public static void applyThrottle(boolean on) {
+        BridgeService s = instance;
+        if (s == null || s.rawServer == null) return;
+        s.releaseWifiLock();
+        s.acquireLocks();
+        if (on) s.unadvertise();
+        else if (s.nsdListener == null) s.advertise(s.rawPort);
     }
 
     /** The target the running bridge prints to, footer included, or null when stopped. */
@@ -126,6 +150,7 @@ public final class BridgeService extends Service {
                     startBridge();
                 } catch (Exception e) {
                     Log.e("Could not start the bridge", e);
+                    EventLog.failed("Bridge could not start · " + e.getMessage());
                     statusText = "Error: " + e.getMessage();
                     updateNotification(statusText);
                 }
@@ -147,19 +172,53 @@ public final class BridgeService extends Service {
         rawServer = new RawServer(target, prefs.isStatusReplies(), prefs.getModelName(),
                 prefs.getIdleTimeoutMs(), prefs.getRawPort());
         rawServer.start(prefs.getRawPort());
+        rawPort = prefs.getRawPort();
 
         if (prefs.isEposEnabled()) {
-            eposServer = new EposHttpServer(target);
+            EposHttpServer.DeviceIdSource ids = new EposHttpServer.DeviceIdSource() {
+                @Override
+                public String deviceId() {
+                    return new Prefs(BridgeService.this).getEposDeviceId();
+                }
+            };
+            byte[] der = null;
+            SSLServerSocketFactory tls = null;
+            try {
+                // RSA key generation takes a moment on an old phone; this runs on the start thread, not the UI.
+                TlsCertificate.Material m = TlsCertificate.load(new File(getFilesDir(), "tls"), NetUtil.getLanAddresses());
+                if (m.note != null) Log.w(m.note);
+                if (m.generated) Log.i("Made a self-signed HTTPS certificate for " + m.addresses + " (valid 10 years).");
+                der = m.certificateDer;
+                tls = m.serverSocketFactory();
+            } catch (Throwable t) {
+                Log.w("HTTPS certificate not available: " + t);
+            }
+
+            eposServer = new EposHttpServer(target, ids, null, der);
+            eposServer.setHttpsPort(prefs.getEposHttpsPort());
             try {
                 eposServer.start(prefs.getEposPort());
             } catch (Exception e) {
                 Log.w("ePOS endpoint could not start on port " + prefs.getEposPort() + ": " + e.getMessage());
                 eposServer = null;
             }
+            if (tls != null) {
+                httpsServer = new EposHttpServer(target, ids, tls, der);
+                try {
+                    httpsServer.start(prefs.getEposHttpsPort());
+                    Log.i("ePOS over HTTPS answers device id \"" + prefs.getEposDeviceId() + "\"; clients trust it once at https://"
+                            + (NetUtil.getLanAddress() == null ? "<phone address>" : NetUtil.getLanAddress()) + ":" + prefs.getEposHttpsPort() + "/cert");
+                } catch (Exception e) {
+                    Log.w("ePOS HTTPS endpoint could not start on port " + prefs.getEposHttpsPort() + ": " + e.getMessage());
+                    httpsServer = null;
+                }
+            }
         }
 
         acquireLocks();
-        advertise(prefs.getRawPort());
+        if (Throttle.isActive(this)) Log.w("Cool-down is active: normal Wi-Fi lock, no network announcement until it ends.");
+        else advertise(prefs.getRawPort());
+        DeviceMonitor.get(this).acquire("service");
 
         String ip = NetUtil.getLanAddress();
         statusText = (ip == null ? "No Wi-Fi address" : ip + ":" + prefs.getRawPort())
@@ -281,11 +340,14 @@ public final class BridgeService extends Service {
         }
     }
 
+    @SuppressWarnings("deprecation")
     private void acquireLocks() {
         try {
             WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wifi != null && wifiLock == null) {
-                wifiLock = wifi.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "UsbLanBridge");
+                // High-performance mode keeps the radio awake for quick prints; a cool-down settles for the normal lock.
+                int mode = Throttle.isActive(this) ? WifiManager.WIFI_MODE_FULL : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                wifiLock = wifi.createWifiLock(mode, "UsbLanBridge");
                 wifiLock.setReferenceCounted(false);
                 wifiLock.acquire();
             }
@@ -300,16 +362,20 @@ public final class BridgeService extends Service {
         }
     }
 
-    private void releaseLocks() {
+    private void releaseWifiLock() {
         try {
             if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
         } catch (Exception ignored) {
         }
+        wifiLock = null;
+    }
+
+    private void releaseLocks() {
+        releaseWifiLock();
         try {
             if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         } catch (Exception ignored) {
         }
-        wifiLock = null;
         wakeLock = null;
     }
 
@@ -323,6 +389,10 @@ public final class BridgeService extends Service {
         if (eposServer != null) {
             eposServer.stop();
             eposServer = null;
+        }
+        if (httpsServer != null) {
+            httpsServer.stop();
+            httpsServer = null;
         }
         if (usbTarget != null) {
             usbTarget.close();
@@ -344,6 +414,7 @@ public final class BridgeService extends Service {
         releaseLocks();
         statusText = "Stopped";
         instance = null;
+        DeviceMonitor.get(this).release("service");
         Log.i("Bridge stopped.");
         stopForegroundCompat();
     }
