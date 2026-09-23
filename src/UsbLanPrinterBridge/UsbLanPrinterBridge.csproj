@@ -16,8 +16,8 @@
     <Deterministic>true</Deterministic>
     <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <Version>1.4.1</Version>
-    <FileVersion>1.4.1.0</FileVersion>
+    <Version>1.5.0</Version>
+    <FileVersion>1.5.0.0</FileVersion>
     <AssemblyTitle>USB LAN Printer Bridge</AssemblyTitle>
     <Product>USB LAN Printer Bridge</Product>
     <Company>USB LAN Printer Bridge</Company>
