@@ -264,6 +264,7 @@ and, on tap, each ticket as it went to the printer.
 | Raster encoder, ticket footer, NO CUT filter, ticket renderer, licence check, certificate builder, telemetry log, event list | 93 desktop checks |
 | Network scan | logic verified against a live LAN, where it identified a TM-T20II from its `GS I 67` reply |
 | Forwarding to a network printer | verified from that phone to an Epson TM printer on the LAN, test receipt and a raw ticket from a PC |
+| Weighing scale (network) and `/scale` | 55 desktop checks: the parser, the exact EU/US unit conversion, and the TCP reader with the `/scale` endpoint end to end. The app with the scale card builds and installs on the Armor 9. **Not yet tested against a physical scale** |
 | NO CUT on a real ticket | verified on that path: the log names the `GS V 66 0` removed and the 4-line feed sent instead |
 | Print service (the phone's Print menu) | registered with Android and offers its printer to the Print menu; **a page printed through it not yet checked** |
 | Sunmi built-in printer | written to the published interface and guarded, **not yet run on a Sunmi terminal** |

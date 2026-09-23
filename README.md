@@ -78,8 +78,12 @@ Build instructions are in each app's README: [Windows](windows/README.md), [Andr
 
 ## What has been verified
 
-* The Windows bridge prints from **Loyverse** by IP address alone, and passes its 65-check self-test suite, which
+* The Windows bridge prints from **Loyverse** by IP address alone, and passes its 68-check self-test suite, which
   also renders the main window and the Device tab to screenshots.
+* The **weighing scale** (`/scale`) is covered by desktop checks on both apps: the parser, the exact EU/US unit
+  conversion, and the TCP reader with the `/scale` endpoint end to end (68/68 on Windows, 55/55 on Android). The
+  Android app with the scale card builds and installs on the phone. It has **not** yet been tested against a
+  physical scale.
 * Every reply the bridges send was captured from a real **Epson TM-T20II**, not taken from documentation.
 * The Android app runs on a real phone (Android 10), starts from its screen, forwards tickets from a PC to an
   Epson TM printer on the LAN with NO CUT verified on that path, prints over ePOS http and https from a PC with
