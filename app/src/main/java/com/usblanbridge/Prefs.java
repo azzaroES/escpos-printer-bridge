@@ -223,4 +223,29 @@ public final class Prefs {
     public void setAutoStart(boolean v) {
         p.edit().putBoolean("autoStart", v).apply();
     }
+
+    // ---- scale (a weighing scale published as GET /scale) ----
+
+    public boolean isScaleEnabled() { return p.getBoolean("scaleEnabled", false); }
+
+    public void setScaleEnabled(boolean v) { p.edit().putBoolean("scaleEnabled", v).apply(); }
+
+    /** Host/IP of the network scale to read (a serial scale is reached by plugging it into any machine on the LAN). */
+    public String getScaleHost() { return p.getString("scaleHost", ""); }
+
+    public void setScaleHost(String v) { p.edit().putString("scaleHost", v == null ? "" : v.trim()).apply(); }
+
+    public int getScalePort() { return p.getInt("scalePort", 4001); }
+
+    public void setScalePort(int v) { p.edit().putInt("scalePort", v).apply(); }
+
+    /** Port the /scale endpoint listens on. Cannot be below 1024 on an unrooted phone. */
+    public int getScaleHttpPort() { return p.getInt("scaleHttpPort", 8020); }
+
+    public void setScaleHttpPort(int v) { p.edit().putInt("scaleHttpPort", v).apply(); }
+
+    /** Present the weight in this unit (kg/g/lb/oz) whatever the scale sends; empty = as the scale reports. */
+    public String getScaleDisplayUnit() { return p.getString("scaleDisplayUnit", ""); }
+
+    public void setScaleDisplayUnit(String v) { p.edit().putString("scaleDisplayUnit", v == null ? "" : v.trim()).apply(); }
 }
