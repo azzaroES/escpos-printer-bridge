@@ -72,6 +72,9 @@ namespace UsbLanPrinterBridge.UI
         private DeviceTab _deviceTab;
         private DeviceMonitor _deviceMonitor;
         private CoolingControl _cooling;
+        private TabPage _tabScale;
+        private ScaleTab _scaleTab;
+        private ScaleService _scaleService;
         private TextBox _txtDevId;
         private Label _lblEposRow;
         private Label _lblCopyNote;
@@ -234,10 +237,15 @@ namespace UsbLanPrinterBridge.UI
             _tabDevice = new TabPage("Device") { Name = "device", Padding = new Padding(0) };
             _deviceTab = new DeviceTab();
             _tabDevice.Controls.Add(_deviceTab);
+            _tabScale = new TabPage("Scale") { Name = "scale", Padding = new Padding(0) };
+            _scaleService = new ScaleService(_manager);
+            _scaleTab = new ScaleTab(_scaleService);
+            _tabScale.Controls.Add(_scaleTab);
             _tabs.TabPages.Add(_tabLog);
             _tabs.TabPages.Add(_tabActions);
             _tabs.TabPages.Add(_tabPrintLog);
             _tabs.TabPages.Add(_tabDevice);
+            _tabs.TabPages.Add(_tabScale);
             _tabs.SelectedIndexChanged += (s, e) => AdjustLayoutForTab();
             _detacher = new TabDetacher(_tabs, Program.LoadIcon(32));
             _detacher.Changed += (s, e) => OnTabsDetachedOrDocked();
@@ -476,6 +484,17 @@ namespace UsbLanPrinterBridge.UI
             if (!_options.Minimized) BeginInvoke(new Action(RestoreFloatingTabs));
             _deviceMonitor.Start();
 
+            // The Scale tab: reads a serial/USB or network scale and publishes GET /scale. Auto-starts if enabled.
+            _scaleTab.Bind(_config.Scale, () => { try { SaveConfig(false); } catch (Exception ex) { Logger.Error("Could not save the scale settings", ex); } });
+            if (_config.Scale != null && _config.Scale.Enabled)
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    StartOutcome o = _scaleService.Start(_config.Scale);
+                    if (!o.Success) Logger.Warn("Scale did not start: " + o.Message);
+                }));
+            }
+
             Logger.Info("Configuration: " + ConfigStore.ConfigPath);
             if (!_manager.IsElevated)
                 Logger.Warn("Not running as administrator. Bridges can use this PC's existing addresses (or 0.0.0.0) but cannot add virtual addresses or firewall rules.");
@@ -518,6 +537,7 @@ namespace UsbLanPrinterBridge.UI
             SyncConfigFromGrid();
             SaveConfig(false);
             try { _probe.Stop(); } catch { }
+            if (_scaleService != null) { try { _scaleService.Stop(); } catch { } }
             try { _manager.StopAll(); } catch (Exception ex) { Logger.Error("Error while stopping", ex); }
             _tray.Visible = false;
             _tray.Dispose();

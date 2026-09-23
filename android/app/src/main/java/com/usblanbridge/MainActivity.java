@@ -163,6 +163,12 @@ public final class MainActivity extends Activity {
     private EditText eposPort;
     private Switch statusReplies;
     private Switch autoStart;
+    private Switch scaleSwitch;
+    private EditText scaleHost;
+    private EditText scalePortField;
+    private EditText scaleHttpField;
+    private EditText scaleUnit;
+    private SectionView scaleSection;
 
     // print service, footer, log
     private TextView printServiceView;
@@ -325,6 +331,7 @@ public final class MainActivity extends Activity {
         column.add(buildEposIdCard());
         column.add(buildTicketsCard());
         column.add(buildOptionsCard());
+        column.add(buildScaleCard());
         column.add(buildPrintServiceCard());
         column.add(buildFooterCard());
         column.add(buildLogCard());
@@ -746,6 +753,43 @@ public final class MainActivity extends Activity {
         autoStart.setChecked(prefs.isAutoStart());
         card.addView(switchRow("Start sharing after a reboot", "The bridge comes back on its own when the phone restarts.", autoStart));
         return optionsSection.content(card);
+    }
+
+    /** The card that reads a weighing scale and publishes it at /scale, mirroring the Windows Scale tab. */
+    private SectionView buildScaleCard() {
+        LinearLayout card = body();
+        scaleSection = section("scale", "Scale");
+
+        scaleSwitch = new Switch(this);
+        scaleSwitch.setChecked(prefs.isScaleEnabled());
+        card.addView(switchRow("Publish a scale on the network", "Reads a scale and serves the weight at /scale so any POS on the Wi-Fi can read it. Applies at the next start.", scaleSwitch));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        scaleHost = edit(prefs.getScaleHost(), "192.168.1.50", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS, 2f);
+        scaleHost.setContentDescription("field_scale_host");
+        scalePortField = edit(String.valueOf(prefs.getScalePort()), "4001", InputType.TYPE_CLASS_NUMBER, 1f);
+        scalePortField.setContentDescription("field_scale_port");
+        row.addView(labelled("Scale host / IP", scaleHost));
+        View pB = labelled("Port", scalePortField);
+        ((LinearLayout.LayoutParams) pB.getLayoutParams()).leftMargin = dp(8);
+        row.addView(pB);
+        card.addView(row);
+
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        scaleHttpField = edit(String.valueOf(prefs.getScaleHttpPort()), "8020", InputType.TYPE_CLASS_NUMBER, 1f);
+        scaleHttpField.setContentDescription("field_scale_http_port");
+        scaleUnit = edit(prefs.getScaleDisplayUnit(), "as scale (kg/g/lb/oz)", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS, 1f);
+        scaleUnit.setContentDescription("field_scale_unit");
+        row2.addView(labelled("Publish on port", scaleHttpField));
+        View uB = labelled("Show as", scaleUnit);
+        ((LinearLayout.LayoutParams) uB.getLayoutParams()).leftMargin = dp(8);
+        row2.addView(uB);
+        card.addView(row2);
+
+        card.addView(hintText("A network scale streams its weight over TCP: enter its address and port. A serial scale is reached by plugging it into any machine on the LAN and reading it here over TCP. The weight is served at http://<phone>:8020/scale, with an exact kg/g/lb/oz conversion when you set \"Show as\". A port below 1024 cannot be used on an unrooted phone."));
+        return scaleSection.content(card);
     }
 
     private SectionView buildPrintServiceCard() {
@@ -1262,6 +1306,11 @@ public final class MainActivity extends Activity {
         prefs.setStatusReplies(statusReplies.isChecked());
         prefs.setAutoStart(autoStart.isChecked());
         prefs.setNoCut(noCutSwitch.isChecked());
+        prefs.setScaleEnabled(scaleSwitch.isChecked());
+        prefs.setScaleHost(scaleHost.getText().toString().trim());
+        prefs.setScalePort(parsePort(scalePortField.getText().toString(), 4001));
+        prefs.setScaleHttpPort(parsePort(scaleHttpField.getText().toString(), 8020));
+        prefs.setScaleDisplayUnit(scaleUnit.getText().toString().trim());
         UsbDevice device = selectedDevice();
         if (device != null) prefs.setUsbDeviceName(device.getDeviceName());
     }

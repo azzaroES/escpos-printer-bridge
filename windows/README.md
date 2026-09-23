@@ -53,6 +53,23 @@ between networks.
 To point a mapping at a different printer, stop that row, pick the new printer, and start it again. The log
 confirms the switch with a line naming both printers.
 
+## Weighing scale (`/scale`)
+
+The **Scale** tab reads a weighing scale and publishes its weight on the LAN, so the POS reads the weight over
+Wi-Fi and the scale can sit on any machine running the bridge, wireless by nature.
+
+* **Serial / USB**: pick the COM port (an RS232 scale plugs in through a cheap RS232-to-USB adapter, which appears
+  as a COM port) and set the baud (usually 9600 8N1).
+* **Network scale**: point it at the scale's `host:port`; a scale that streams its weight over TCP is read directly.
+* The weight is served as JSON at `http://<address>:8020/scale`:
+  `{"ok":true,"weight":1.234,"unit":"kg","grams":1234,"stable":true,"raw":"...","ageMs":12}`.
+  `GET /scale/raw` returns the last raw lines, to identify an unknown scale's format.
+* **Show as**: present the weight in kg, g, lb or oz whatever the scale reports, using exact conversions
+  (`1 lb = 453.59237 g`, `1 oz = 28.349523125 g`), so EU and US devices interoperate without drift. The canonical
+  `grams` is always included so any consumer can convert.
+* The endpoint can bind its **own LAN address** (a virtual IP, like the printers), so the scale looks like a
+  standalone network device. Every connection and reading is logged to a daily `scale-YYYYMMDD.log`.
+
 ## Connecting devices
 
 | Device | How |

@@ -104,6 +104,92 @@ namespace UsbLanPrinterBridge.Core
         [XmlAttribute] public int Height { get; set; }
     }
 
+    /// <summary>
+    /// A weighing scale published on the LAN as GET /scale. Reads a serial/USB COM port or a network scale's TCP
+    /// stream, so the scale can live on any machine running the bridge and the POS reads it over Wi-Fi.
+    /// </summary>
+    public sealed class ScaleConfig
+    {
+        public ScaleConfig()
+        {
+            Transport = "serial";
+            Baud = 9600;
+            DataBits = 8;
+            Parity = "none";
+            StopBits = "1";
+            HttpPort = 8020;
+            BindAddress = "";
+            Adapter = "";
+            PortName = "";
+            Host = "";
+        }
+
+        public bool Enabled { get; set; }
+        /// <summary>"serial" (a COM port / RS232-to-USB) or "tcp" (a network scale).</summary>
+        public string Transport { get; set; }
+
+        // serial
+        public string PortName { get; set; }
+        public int Baud { get; set; }
+        public int DataBits { get; set; }
+        public string Parity { get; set; }
+        public string StopBits { get; set; }
+
+        // tcp (network scale)
+        public string Host { get; set; }
+        public int TcpPort { get; set; }
+
+        /// <summary>Optional command sent to poll a scale that only answers on request, e.g. "W\r" or "\x05". Empty = passive.</summary>
+        public string PollCommand { get; set; }
+        public int PollIntervalMs { get; set; }
+
+        /// <summary>Address the /scale server binds to. Empty = every address; a LAN IP (even a virtual one) gives the scale its own address.</summary>
+        public string BindAddress { get; set; }
+        /// <summary>Adapter for the virtual address, when BindAddress is one this PC does not already have. Empty = choose automatically.</summary>
+        public string Adapter { get; set; }
+        public int HttpPort { get; set; }
+
+        /// <summary>Present the weight in this unit (kg/g/lb/oz) whatever the scale sends, for EU/US cross-compatibility. Empty = as the scale reports.</summary>
+        public string DisplayUnit { get; set; }
+
+        public bool IsTcp { get { return string.Equals(Transport, "tcp", StringComparison.OrdinalIgnoreCase); } }
+
+        /// <summary>The poll command as bytes, decoding \r \n \t \\ and \xHH escapes. Null when empty.</summary>
+        public byte[] PollBytes()
+        {
+            if (string.IsNullOrEmpty(PollCommand)) return null;
+            var bytes = new List<byte>(PollCommand.Length);
+            for (int i = 0; i < PollCommand.Length; i++)
+            {
+                char c = PollCommand[i];
+                if (c == '\\' && i + 1 < PollCommand.Length)
+                {
+                    char n = PollCommand[++i];
+                    switch (n)
+                    {
+                        case 'r': bytes.Add((byte)'\r'); break;
+                        case 'n': bytes.Add((byte)'\n'); break;
+                        case 't': bytes.Add((byte)'\t'); break;
+                        case '\\': bytes.Add((byte)'\\'); break;
+                        case 'x':
+                            if (i + 2 < PollCommand.Length)
+                            {
+                                int val;
+                                if (int.TryParse(PollCommand.Substring(i + 1, 2), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out val))
+                                { bytes.Add((byte)val); i += 2; }
+                                else bytes.Add((byte)'x');
+                            }
+                            else bytes.Add((byte)'x');
+                            break;
+                        default: bytes.Add((byte)n); break;
+                    }
+                }
+                else bytes.Add((byte)c);
+            }
+            return bytes.Count == 0 ? null : bytes.ToArray();
+        }
+    }
+
     [XmlRoot("UsbLanPrinterBridge")]
     public sealed class BridgeConfig
     {
@@ -118,7 +204,11 @@ namespace UsbLanPrinterBridge.Core
             CollapsedSections = new List<string>();
             SectionOrders = new List<SectionOrder>();
             FloatingTabs = new List<FloatingTabState>();
+            Scale = new ScaleConfig();
         }
+
+        /// <summary>The optional weighing scale published as GET /scale.</summary>
+        public ScaleConfig Scale { get; set; }
 
         /// <summary>Bottom tabs pulled out into their own windows, reopened in place at the next start.</summary>
         public List<FloatingTabState> FloatingTabs { get; set; }
@@ -243,6 +333,11 @@ namespace UsbLanPrinterBridge.Core
                     if (cfg.CollapsedSections == null) cfg.CollapsedSections = new List<string>();
                     if (cfg.SectionOrders == null) cfg.SectionOrders = new List<SectionOrder>();
                     if (cfg.FloatingTabs == null) cfg.FloatingTabs = new List<FloatingTabState>();
+                    if (cfg.Scale == null) cfg.Scale = new ScaleConfig();
+                    if (string.IsNullOrWhiteSpace(cfg.Scale.Transport)) cfg.Scale.Transport = "serial";
+                    if (cfg.Scale.Baud <= 0) cfg.Scale.Baud = 9600;
+                    if (cfg.Scale.DataBits <= 0) cfg.Scale.DataBits = 8;
+                    if (cfg.Scale.HttpPort <= 0 || cfg.Scale.HttpPort > 65535) cfg.Scale.HttpPort = 8020;
                     foreach (MappingConfig m in cfg.Mappings)
                     {
                         if (string.IsNullOrEmpty(m.Id)) m.Id = Guid.NewGuid().ToString("N");

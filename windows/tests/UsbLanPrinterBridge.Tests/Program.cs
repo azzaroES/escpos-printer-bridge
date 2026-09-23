@@ -65,6 +65,10 @@ namespace UsbLanPrinterBridge.Tests
             Run("Config: ePOS device id is sanitised and builds the links", Config_DeviceId);
             Run("Printer status: XPS writer is ready; an unknown printer is reported once", Status_Probe);
 
+            Run("Scale: parser reads the common weight formats", Scale_ParserFormats);
+            Run("Scale: exact EU/US unit conversion and canonical grams", Scale_UnitConversion);
+            Run("Scale: TCP network scale end to end through /scale", Scale_EndToEndTcp);
+
             Run("Listener: one connection = one job", Listener_SingleJob);
             Run("Listener: idle timeout splits jobs on a kept-open connection", Listener_IdleSplit);
             Run("Listener: idle timeout 0 waits for disconnect", Listener_NoIdle);
@@ -114,6 +118,132 @@ namespace UsbLanPrinterBridge.Tests
         }
 
         // ------------------------------------------------------------------ helpers
+
+        private static void Scale_ParserFormats()
+        {
+            CheckReading("ST,GS,+  1.234kg", true, 1.234m, "kg", true);
+            CheckReading("US,GS,+  0.500 kg", true, 0.5m, "kg", false);
+            CheckReading("+001.250 kg", true, 1.25m, "kg", true);
+            CheckReading("  2.000kg ", true, 2.0m, "kg", true);
+            CheckReading("0.750 lb", true, 0.75m, "lb", true);
+            CheckReading("1,234kg", true, 1.234m, "kg", true);     // EU decimal comma
+            CheckReading("-0.005 kg", true, -0.005m, "kg", true);   // negative (tare)
+            CheckReading("W  12.34 oz", true, 12.34m, "oz", true);
+
+            ScaleReading bad = ScaleParser.Parse("no weight here");
+            Check(!bad.Ok, "a line with no number must not parse");
+            Check(ScaleParser.Parse("weird").Raw == "weird", "the raw line is preserved on an unparsed reading");
+
+            Check(ScaleParser.Parse("ST,GS,+  1.234kg").ToJson().Contains("\"weight\":1.234"), "ToJson carries the weight");
+        }
+
+        private static void CheckReading(string line, bool ok, decimal weight, string unit, bool stable)
+        {
+            ScaleReading r = ScaleParser.Parse(line);
+            Check(r.Ok == ok, "parse Ok=" + r.Ok + " (expected " + ok + ") for '" + line + "'");
+            if (!ok) return;
+            Check(r.Weight == weight, "weight " + r.Weight + " != " + weight + " for '" + line + "'");
+            Check(r.Unit == unit, "unit '" + r.Unit + "' != '" + unit + "' for '" + line + "'");
+            Check(r.Stable == stable, "stable " + r.Stable + " != " + stable + " for '" + line + "'");
+        }
+
+        private static void Scale_UnitConversion()
+        {
+            decimal r;
+            Check(ScaleUnits.TryConvert(1m, "kg", "lb", out r) && decimal.Round(r, 10) == 2.2046226218m, "1 kg -> lb was " + r);
+            Check(ScaleUnits.TryConvert(1m, "lb", "kg", out r) && r == 0.45359237m, "1 lb -> kg was " + r);
+            Check(ScaleUnits.TryConvert(1m, "lb", "oz", out r) && r == 16m, "1 lb -> oz was " + r);
+            Check(ScaleUnits.TryConvert(1000m, "g", "kg", out r) && r == 1m, "1000 g -> kg was " + r);
+            Check(!ScaleUnits.TryConvert(1m, "kg", "furlong", out r), "an unknown unit must not convert");
+
+            ScaleReading kg = ScaleParser.Parse("2.000 kg");
+            Check(kg.HasGrams && kg.Grams == 2000m, "canonical grams for 2 kg was " + kg.Grams);
+            Check(kg.ToJson().Contains("\"grams\":2000"), "grams is published in the JSON");
+
+            ScaleReading asLb = kg.InUnit("lb");
+            Check(asLb.Unit == "lb" && asLb.Weight == 4.4092m, "2 kg shown as lb was " + asLb.Weight + " " + asLb.Unit);
+            Check(asLb.Grams == 2000m, "grams stays canonical across a unit view (" + asLb.Grams + ")");
+            Check(kg.InUnit("kg").Weight == 2.000m, "converting to the same unit returns the value unchanged");
+
+            ScaleReading noUnit = ScaleParser.Parse("1.500");
+            Check(noUnit.Ok && !noUnit.HasGrams, "a reading with no unit has no canonical grams");
+            Check(noUnit.InUnit("kg").Unit == "", "a reading with no unit cannot be converted");
+        }
+
+        private static void Scale_EndToEndTcp()
+        {
+            // A fake network scale that streams a stable 1.234 kg on a loopback socket.
+            var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            int scalePort = ((IPEndPoint)listener.LocalEndpoint).Port;
+            var stop = new ManualResetEventSlim(false);
+            var feeder = new Thread(() =>
+            {
+                try
+                {
+                    using (var c = listener.AcceptTcpClient())
+                    {
+                        var ns = c.GetStream();
+                        byte[] line = Ascii("ST,GS,+  1.234kg\r\n");
+                        while (!stop.IsSet) { try { ns.Write(line, 0, line.Length); ns.Flush(); } catch { break; } Thread.Sleep(80); }
+                    }
+                }
+                catch { }
+            }) { IsBackground = true };
+            feeder.Start();
+
+            var reader = new ScaleReader(() => new TcpScaleSource("127.0.0.1", scalePort), null, 0);
+            reader.Start();
+            ScaleServer server = null;
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                while (sw.ElapsedMilliseconds < 6000 && !(reader.Current.Ok && reader.Current.Weight == 1.234m)) Thread.Sleep(50);
+                Check(reader.Current.Ok, "the reader received no weight from the fake scale");
+                Check(reader.Current.Weight == 1.234m, "weight was " + reader.Current.Weight);
+                Check(reader.Current.Unit == "kg", "unit was '" + reader.Current.Unit + "'");
+                Check(reader.Current.Stable, "the reading should be stable");
+                Check(reader.Connected, "the reader should report connected");
+
+                server = new ScaleServer(() => reader.Current, reader.RecentRaw, () => reader.Status, () => reader.Connected);
+                server.Start(IPAddress.Loopback, 0);
+                int httpPort = server.LocalEndPoint.Port;
+
+                string resp = HttpGetBody("127.0.0.1", httpPort, "/scale");
+                Check(resp.Contains("\"weight\":1.234"), "GET /scale missing weight: " + resp);
+                Check(resp.Contains("\"unit\":\"kg\""), "GET /scale missing unit: " + resp);
+                Check(resp.Contains("\"stable\":true"), "GET /scale missing stable: " + resp);
+
+                string raw = HttpGetBody("127.0.0.1", httpPort, "/scale/raw");
+                Check(raw.Contains("1.234kg"), "GET /scale/raw missing the raw line: " + raw);
+            }
+            finally
+            {
+                if (server != null) server.Stop();
+                reader.Stop();
+                stop.Set();
+                try { listener.Stop(); } catch { }
+            }
+        }
+
+        private static string HttpGetBody(string host, int port, string path)
+        {
+            using (var c = new System.Net.Sockets.TcpClient())
+            {
+                c.Connect(host, port);
+                var ns = c.GetStream();
+                byte[] req = Ascii("GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n");
+                ns.Write(req, 0, req.Length); ns.Flush();
+                using (var ms = new MemoryStream())
+                {
+                    var buf = new byte[1024]; int n;
+                    try { while ((n = ns.Read(buf, 0, buf.Length)) > 0) ms.Write(buf, 0, n); } catch { }
+                    string all = Encoding.UTF8.GetString(ms.ToArray());
+                    int idx = all.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                    return idx >= 0 ? all.Substring(idx + 4) : all;
+                }
+            }
+        }
 
         private static void Run(string name, Action test)
         {
@@ -1821,12 +1951,12 @@ namespace UsbLanPrinterBridge.Tests
             Check(savedCards != null && savedCards[0] == "cooling" && savedBlocks != null && savedBlocks[0] == "sys.events", "the dragged order is saved in the configuration");
 
             // bottom tabs: the print log is a tab, and a tab can be pulled out into its own window and docked back
-            Check(tabsBefore != null && string.Join(",", tabsBefore) == "log,actions,printlog,device", "the print log is a tab beside Log, Printer actions and Device: " + string.Join(",", tabsBefore ?? new string[0]));
-            Check(detached && floatingReported && tabsWhileFloating != null && string.Join(",", tabsWhileFloating) == "log,actions,device", "pulled out, it leaves the tab strip: " + string.Join(",", tabsWhileFloating ?? new string[0]));
+            Check(tabsBefore != null && string.Join(",", tabsBefore) == "log,actions,printlog,device,scale", "the print log is a tab beside Log, Printer actions, Device and Scale: " + string.Join(",", tabsBefore ?? new string[0]));
+            Check(detached && floatingReported && tabsWhileFloating != null && string.Join(",", tabsWhileFloating) == "log,actions,device,scale", "pulled out, it leaves the tab strip: " + string.Join(",", tabsWhileFloating ?? new string[0]));
             string floating = Path.Combine(OutDir, "printlog-floating.png");
             Check(floatingTitle != null && File.Exists(floating) && new FileInfo(floating).Length > 3000, "it lives in a window of its own (\"" + floatingTitle + "\"), screenshot: " + floating);
             Check(floatingSaved, "the floating window and its place are saved, to be reopened at the next start");
-            Check(!floatingAfterDock && tabsAfterDock != null && string.Join(",", tabsAfterDock) == "log,actions,printlog,device", "docked back, it returns to its old place: " + string.Join(",", tabsAfterDock ?? new string[0]));
+            Check(!floatingAfterDock && tabsAfterDock != null && string.Join(",", tabsAfterDock) == "log,actions,printlog,device,scale", "docked back, it returns to its old place: " + string.Join(",", tabsAfterDock ?? new string[0]));
             Check(saved.FloatingTabs.Count == 0, "and the saved layout no longer lists it");
             ConfigStore.DataDirectory = Path.Combine(OutDir, "data");
         }

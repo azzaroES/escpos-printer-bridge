@@ -431,6 +431,23 @@ namespace UsbLanPrinterBridge.Core
         }
 
         /// <summary>
+        /// Reserves a LAN address for a non-printer device (the scale) so it can have its own IP, using the same
+        /// virtual-address machinery as the printers. Any/loopback/existing addresses need no lease and return Ok.
+        /// </summary>
+        public StartOutcome LeaseAddress(IPAddress ip, string preferredAdapter)
+        {
+            if (ip == null || ip.Equals(IPAddress.Any) || NetworkHelper.IsLocalAddress(ip)) return StartOutcome.Ok(null);
+            return AcquireVirtualIp(ip, preferredAdapter);
+        }
+
+        /// <summary>Releases an address taken with <see cref="LeaseAddress"/>. Safe to call for Any/local addresses.</summary>
+        public void ReleaseAddress(IPAddress ip)
+        {
+            if (ip == null || ip.Equals(IPAddress.Any) || NetworkHelper.IsLocalAddress(ip)) return;
+            ReleaseVirtualIp(ip);
+        }
+
+        /// <summary>
         /// Re-adds virtual addresses that disappeared (adapter reconnected, driver reset, ...). The listener socket stays
         /// bound to the address in the meantime, so once the address is back, printing resumes. Call from a worker thread.
         /// </summary>

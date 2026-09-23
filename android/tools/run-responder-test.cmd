@@ -49,7 +49,11 @@ rem tools\stubs supplies desktop stand-ins for those two classes so the servers 
   "app\src\main\java\com\usblanbridge\core\RawServer.java" ^
   "app\src\main\java\com\usblanbridge\core\EposPrintConverter.java" ^
   "app\src\main\java\com\usblanbridge\core\EposHttpServer.java" ^
-  "tools\EposServerSelfTest.java"
+  "app\src\main\java\com\usblanbridge\core\ScaleReading.java" ^
+  "app\src\main\java\com\usblanbridge\core\ScaleReader.java" ^
+  "app\src\main\java\com\usblanbridge\core\ScaleServer.java" ^
+  "tools\EposServerSelfTest.java" ^
+  "tools\ScaleSelfTest.java"
 if errorlevel 1 (
   echo Compilation of the server test failed.
   exit /b 1
@@ -69,7 +73,12 @@ echo === ePOS server, http and https ===
 "%JAVA_HOME%\bin\java.exe" -cp "%OUT%" EposServerSelfTest
 set R3=%errorlevel%
 
-set /a RESULT=%R1%+%R2%+%R3%
+echo.
+echo === scale: parser, EU/US units, TCP reader and /scale endpoint ===
+"%JAVA_HOME%\bin\java.exe" -cp "%OUT%" ScaleSelfTest
+set R4=%errorlevel%
+
+set /a RESULT=%R1%+%R2%+%R3%+%R4%
 echo.
 if %RESULT%==0 (
   echo All checks passed.

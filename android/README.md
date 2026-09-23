@@ -232,6 +232,16 @@ model. A real receipt printer replies with a header byte, its model name and a N
 instead of a bare address. Subnets wider than 1022 addresses are truncated, because sweeping a /16 is not
 practical on a phone.
 
+## Weighing scale
+
+The **Scale** card reads a network scale over TCP and publishes its weight at `http://<phone>:8020/scale`, so any
+POS on the Wi-Fi reads it. Enter the scale's address and port; a serial scale is reached by plugging it into any
+machine on the LAN and reading it here over TCP. The JSON is
+`{"ok":true,"weight":1.234,"unit":"kg","grams":1234,"stable":true,"raw":"...","ageMs":12}`, and **Show as** presents
+the weight in kg / g / lb / oz with exact conversions (`1 lb = 453.59237 g`, `1 oz = 28.349523125 g`) so EU and US
+devices interoperate without drift; the canonical `grams` is always included. `GET /scale/raw` returns the last raw
+lines to identify an unknown scale. Port 8020 is used because an unrooted phone cannot bind below 1024.
+
 ## Logs
 
 Some ROMs hide app output from `logcat`, so the app writes its own log to

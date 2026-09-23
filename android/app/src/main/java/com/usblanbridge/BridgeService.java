@@ -24,6 +24,10 @@ import com.usblanbridge.core.Log;
 import com.usblanbridge.core.NetUtil;
 import com.usblanbridge.core.PrintTarget;
 import com.usblanbridge.core.RawServer;
+import com.usblanbridge.core.EventLog;
+import com.usblanbridge.core.ScaleReader;
+import com.usblanbridge.core.ScaleReading;
+import com.usblanbridge.core.ScaleServer;
 import com.usblanbridge.core.SunmiPrintTarget;
 import com.usblanbridge.core.TcpPrintTarget;
 import com.usblanbridge.core.TlsCertificate;
@@ -55,6 +59,8 @@ public final class BridgeService extends Service {
     private RawServer rawServer;
     private EposHttpServer eposServer;
     private EposHttpServer httpsServer;
+    private ScaleReader scaleReader;
+    private ScaleServer scaleServer;
     private volatile int rawPort;
     private UsbPrintTarget usbTarget;
     private SunmiPrintTarget sunmiTarget;
@@ -215,6 +221,8 @@ public final class BridgeService extends Service {
             }
         }
 
+        startScale(prefs);
+
         acquireLocks();
         if (Throttle.isActive(this)) Log.w("Cool-down is active: normal Wi-Fi lock, no network announcement until it ends.");
         else advertise(prefs.getRawPort());
@@ -226,6 +234,38 @@ public final class BridgeService extends Service {
         Log.i("Bridge running. Point POS software at " + (ip == null ? "this phone" : ip)
                 + " port " + prefs.getRawPort() + ".");
         updateNotification(statusText);
+    }
+
+    /** Starts the weighing scale reader + the /scale endpoint when enabled. A network scale streams over TCP. */
+    private void startScale(Prefs prefs) {
+        if (!prefs.isScaleEnabled()) return;
+        final String host = prefs.getScaleHost().trim();
+        if (host.isEmpty()) {
+            Log.w("Scale is enabled but no host is set; not started.");
+            return;
+        }
+        final String displayUnit = prefs.getScaleDisplayUnit();
+        final ScaleReader reader = new ScaleReader(host, prefs.getScalePort());
+        ScaleServer server = new ScaleServer(new ScaleServer.Provider() {
+            @Override public ScaleReading current() {
+                ScaleReading r = reader.current();
+                return (displayUnit == null || displayUnit.isEmpty()) ? r : r.inUnit(displayUnit);
+            }
+            @Override public String[] raw() { return reader.recentRaw(); }
+            @Override public String status() { return reader.status(); }
+            @Override public boolean connected() { return reader.isConnected(); }
+        });
+        try {
+            server.start(prefs.getScaleHttpPort());
+            reader.start();
+            scaleReader = reader;
+            scaleServer = server;
+            Log.i("Scale reading " + host + ":" + prefs.getScalePort() + ", published at /scale on port " + server.port());
+            EventLog.warning("Scale started: " + host + ":" + prefs.getScalePort());
+        } catch (Exception e) {
+            Log.w("Scale endpoint could not start on port " + prefs.getScaleHttpPort() + ": " + e.getMessage());
+            try { server.stop(); } catch (Throwable ignored) { }
+        }
     }
 
     private PrintTarget buildTarget(Prefs prefs) throws Exception {
@@ -393,6 +433,14 @@ public final class BridgeService extends Service {
         if (httpsServer != null) {
             httpsServer.stop();
             httpsServer = null;
+        }
+        if (scaleServer != null) {
+            scaleServer.stop();
+            scaleServer = null;
+        }
+        if (scaleReader != null) {
+            scaleReader.stop();
+            scaleReader = null;
         }
         if (usbTarget != null) {
             usbTarget.close();
